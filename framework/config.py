@@ -31,8 +31,8 @@ class AdapterConfig:
     hidden_dim: int = 2048  # MLP hidden dimension
     
     # Stage 1: Subject-Invariant Adapter
-    stage1_num_layers: int = 3
-    stage1_dropout: float = 0.1
+    stage1_num_layers: int = 2
+    stage1_dropout: float = 0.5
     stage1_use_layer_scale: bool = True
     stage1_layer_scale_init: float = 1e-5
     stage1_residual_scale: float = 0.1
@@ -72,7 +72,7 @@ class Stage1TrainingConfig:
     mask_ratio: float = 0.15
     
     # Training hyperparameters
-    num_epochs: int = 50
+    num_epochs: int = 500
     batch_size: int = 64  
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
@@ -144,7 +144,7 @@ class Stage3TrainingConfig:
 @dataclass
 class DataConfig:
     # Paths
-    data_root: str = "./dataset/Podcast/preprocessed"
+    data_root: str = "/user_data/yingjueb/ecog_pretrain/podcast"
     output_root: str = "./outputs"
     cache_dir: str = "./cache"
     
@@ -186,10 +186,10 @@ class DataConfig:
 
 @dataclass
 class LinguisticConfig:
-    transcript_file: str = "./dataset/Podcast/stimuli/podcast_transcript.csv"
-    embeddings_file: str = "./dataset/Podcast/semantic/llama2_7b_lastlayer_word_embeddings.npy"
-       
-    # Feature extraction 
+    transcript_file: str = "/user_data/yingjueb/ecog_pretrain/stimuli/podcast_transcript.csv"
+    embeddings_file: str = "/user_data/yingjueb/ecog_pretrain/semantic/llama2_7b_lastlayer_word_embeddings.npy"
+
+    # Feature extraction
     use_word_embeddings: bool = True
     embedding_model: str = "llama2-7b"  # Llama2-7B last layer
     embedding_layer: int = -1  # Last layer

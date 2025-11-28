@@ -282,7 +282,17 @@ class Stage1Trainer:
             torch.save(checkpoint, best_path)
             print(f" Saved best model to {best_path}")
         
-        checkpoints = sorted(self.output_dir.glob("checkpoint_epoch*.pt"))
+        checkpoints = list(self.output_dir.glob("checkpoint_epoch*.pt"))
+
+        def _extract_epoch(path: Path) -> int:
+            # "checkpoint_epoch123.pt" -> 123
+            name = path.stem  # "checkpoint_epoch123"
+            # 也可以更稳健用 split("epoch")[1]
+            epoch_str = name.split("epoch")[-1]
+            return int(epoch_str)
+
+        checkpoints.sort(key=_extract_epoch)
+
         if len(checkpoints) > self.config.stage1_training.keep_last_n_checkpoints:
             for ckpt in checkpoints[:-self.config.stage1_training.keep_last_n_checkpoints]:
                 ckpt.unlink()

@@ -1,0 +1,11 @@
+mvpformer/
+
+outputs/
+cache/
+
+__pycache__/
+**/__pycache__/
+
+*.pt
+
+**/ckpts/
