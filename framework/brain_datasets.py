@@ -1,10 +1,3 @@
-"""
-1. PodcastECoGDataset: Stage 1
-2. PodcastLinguisticDataset: Stage 2
-3. SubjectSpecificDataset: Stage 3
-
-"""
-
 import torch
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
@@ -17,7 +10,7 @@ import pickle
 
 
 class PodcastECoGDataset(Dataset):
-
+    
     def __init__(
         self,
         data_root: str,
@@ -26,7 +19,6 @@ class PodcastECoGDataset(Dataset):
         config,  
         device: str = 'cuda',
     ):
-        
         self.data_root = Path(data_root)
         self.subjects = subjects
         self.mvpformer = mvpformer_model
@@ -41,9 +33,11 @@ class PodcastECoGDataset(Dataset):
         self.cache_dir = Path(config.cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         
+        # Load preprocessed data
         print("Loading preprocessed Podcast ECoG data...")
         self._load_data()
         
+        # Extract MVPFormer features
         print("Extracting MVPFormer features...")
         self._extract_features()
         
@@ -57,6 +51,21 @@ class PodcastECoGDataset(Dataset):
         self.raw_data = {}
         self.channel_info = {}
         
+        # Load balanced channel indices
+        channel_indices_file = self.data_root.parent / "selected_channel_indices.json"
+        
+        if channel_indices_file.exists():
+            import json
+            with open(channel_indices_file) as f:
+                selected_indices = json.load(f)
+            print(f"\n Using balanced channel selection from: {channel_indices_file}")
+            use_balanced = True
+        else:
+            print(f"\n No balanced channel indices found at {channel_indices_file}")
+            print(f"  Falling back to first 90 channels")
+            use_balanced = False
+            target_channels = 90
+        
         for subj_id in tqdm(self.subjects, desc="Loading subjects"):
             preprocessed_file = self.data_root / f"sub-{subj_id:02d}_hg_z.npy"
             
@@ -65,9 +74,24 @@ class PodcastECoGDataset(Dataset):
                 continue
             
             ecog_data = np.load(preprocessed_file)  # [n_channels, n_samples]
-            print(f"  Subject {subj_id}: shape {ecog_data.shape}")
+            orig_channels = ecog_data.shape[0]
             
-            # Create sliding windows
+            if use_balanced:
+                # Use balanced channel indices
+                indices = selected_indices.get(str(subj_id), None)
+                if indices is None:
+                    print(f"  ⚠ Subject {subj_id}: no indices in json, using first 90")
+                    indices = list(range(min(90, orig_channels)))
+                
+                ecog_data = ecog_data[indices, :]
+                print(f"  Subject {subj_id}: {orig_channels} → {len(indices)} channels (balanced)")
+            else:
+                if orig_channels < target_channels:
+                    print(f"  ⚠ Subject {subj_id}: only {orig_channels} channels, SKIPPING!")
+                    continue
+                ecog_data = ecog_data[:target_channels, :]
+                print(f"  Subject {subj_id}: {orig_channels} → {target_channels} channels")
+            
             windowed_data = self._create_windows(ecog_data)
             
             self.raw_data[subj_id] = windowed_data
@@ -160,7 +184,7 @@ class PodcastECoGDataset(Dataset):
                                     print(f"  Chunk output: {feat.shape}")
                                 
                             except Exception as e:
-                                print(f"Error processing chunk {chunk_idx}:")
+                                print(f"  ✗ Error processing chunk {chunk_idx}:")
                                 print(f"    Chunk shape: {chunk.shape}")
                                 print(f"    Error: {e}")
                                 raise
@@ -250,7 +274,6 @@ class PodcastECoGDataset(Dataset):
 
 
 class PodcastLinguisticDataset(Dataset):
-
     def __init__(
         self,
         data_root: str,
@@ -272,13 +295,14 @@ class PodcastLinguisticDataset(Dataset):
         
         print("Loading linguistic features...")
         self._load_linguistic_features()
-        
+
         print("Aligning brain and linguistic features...")
         self._align_features()
         
-        print(f"✓ Dataset ready: {len(self)} samples")
+        print(f"Dataset ready: {len(self)} samples")
     
     def _load_brain_features(self):
+
         ecog_dataset = PodcastECoGDataset(
             data_root=str(self.data_root),
             subjects=self.subjects,
@@ -326,7 +350,7 @@ class PodcastLinguisticDataset(Dataset):
         # Verify dimension
         expected_dim = self.config.linguistic.embedding_dim
         if self.word_embeddings.shape[1] != expected_dim:
-            print(f"  Warning: Expected dim {expected_dim}, got {self.word_embeddings.shape[1]}")
+            print(f"  ⚠ Warning: Expected dim {expected_dim}, got {self.word_embeddings.shape[1]}")
             print(f"  Update config.linguistic.embedding_dim = {self.word_embeddings.shape[1]}")
         
         # Verify match
@@ -339,7 +363,6 @@ class PodcastLinguisticDataset(Dataset):
         print(f"Transcript and embeddings matched!")
     
     def _align_features(self):
-        # Check if transcript has timing information
         has_onset = 'onset' in self.words_df.columns or 'word_onset' in self.words_df.columns
         
         if has_onset:
@@ -366,6 +389,7 @@ class PodcastLinguisticDataset(Dataset):
             # Find corresponding brain window
             window_idx = int(word_onset / stride)
             
+            # Check if within valid range for all subjects
             for subj_id in self.subjects:
                 if subj_id in self.canonical_features:
                     n_windows = len(self.canonical_features[subj_id])
@@ -379,7 +403,7 @@ class PodcastLinguisticDataset(Dataset):
                         })
     
     def _align_by_sequence(self):
-
+        
         self.aligned_pairs = []
         
         n_words = len(self.words_df)
@@ -412,10 +436,8 @@ class PodcastLinguisticDataset(Dataset):
         brain_idx = pair['brain_idx']
         word_idx = pair['word_idx']
         
-        # Brain feature (canonical space from Stage 1)
         brain_feat = torch.from_numpy(self.canonical_features[subj_id][brain_idx]).float()
         
-        # Word embedding (Llama2 semantic space)
         word_emb = torch.from_numpy(self.word_embeddings[word_idx]).float()
         
         return {
@@ -509,6 +531,7 @@ def create_stage2_dataloader(
     config,  
     split: str = 'train',
 ) -> DataLoader:
+   
     dataset = PodcastLinguisticDataset(
         data_root=data_root,
         subjects=subjects,

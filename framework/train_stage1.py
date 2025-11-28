@@ -23,7 +23,6 @@ class TemporalContrastiveLoss(nn.Module):
         # anchor, positive: [B, D]
         # negatives: [B, N, D]
         
-        # Normalize
         anchor = nn.functional.normalize(anchor, dim=1)
         positive = nn.functional.normalize(positive, dim=1)
         negatives = nn.functional.normalize(negatives, dim=2)
@@ -70,6 +69,7 @@ class CrossSubjectConsistencyLoss(nn.Module):
 # ==================== Trainer ====================
 
 class Stage1Trainer:
+    """Stage 1 Trainer"""
     def __init__(
         self,
         adapter: SubjectInvariantAdapter,
@@ -108,7 +108,6 @@ class Stage1Trainer:
                 method=config.stage1_training.consistency_method
             )
         
-
         self.output_dir = Path(config.data.output_root) / config.name
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
@@ -121,6 +120,7 @@ class Stage1Trainer:
         self.best_val_loss = float('inf')
     
     def _init_wandb(self):
+
         run_name = self.config.system.wandb_run_name or self.config.name
         
         wandb.init(
@@ -136,14 +136,13 @@ class Stage1Trainer:
         
         wandb.watch(self.adapter, log='all', log_freq=100)
         
-        print(f"✓ Weights & Biases initialized")
+        print(f" Weights & Biases initialized")
         print(f"  Project: {self.config.system.wandb_project}")
         print(f"  Run: {run_name}")
         if wandb.run:
             print(f"  URL: {wandb.run.url}")
     
     def train_epoch(self, epoch: int):
-        """Train one epoch"""
         self.adapter.train()
         
         total_loss = 0.0
@@ -160,13 +159,11 @@ class Stage1Trainer:
             canonical = self.adapter(feature)
             canonical_pos = self.adapter(temporal_positive)
             
-            # Cross-subject features
             batch_size, n_subjects, feat_dim = cross_subject_group.shape
             cross_subject_flat = cross_subject_group.view(-1, feat_dim)
             canonical_cross = self.adapter(cross_subject_flat)
             canonical_cross = canonical_cross.view(batch_size, n_subjects, -1)
             
-            # Compute losses
             loss = 0.0
             losses_dict = {}
             
@@ -234,7 +231,6 @@ class Stage1Trainer:
         }
     
     def validate(self, epoch: int):
-        """Validate"""
         self.adapter.eval()
         
         total_loss = 0.0
@@ -284,7 +280,7 @@ class Stage1Trainer:
         if is_best:
             best_path = self.output_dir / "best_model.pt"
             torch.save(checkpoint, best_path)
-            print(f"✓ Saved best model to {best_path}")
+            print(f" Saved best model to {best_path}")
         
         checkpoints = sorted(self.output_dir.glob("checkpoint_epoch*.pt"))
         if len(checkpoints) > self.config.stage1_training.keep_last_n_checkpoints:
@@ -300,7 +296,7 @@ class Stage1Trainer:
 
             train_metrics = self.train_epoch(epoch)
             val_metrics = self.validate(epoch)
-
+            
             print(f"\nEpoch {epoch}/{self.config.stage1_training.num_epochs}")
             print(f"  Train Loss: {train_metrics['total_loss']:.4f}")
             print(f"    Temporal: {train_metrics['temporal_loss']:.4f}")
@@ -315,7 +311,7 @@ class Stage1Trainer:
                     'epoch_metrics/val_loss': val_metrics['val_loss'],
                     'epoch': epoch,
                 }, step=self.global_step)
-
+            
             is_best = val_metrics['val_loss'] < self.best_val_loss
             if is_best:
                 self.best_val_loss = val_metrics['val_loss']
@@ -369,14 +365,13 @@ def main():
     print("\nLoading MVPFormer...")
     
     # Disable Flash Attention to avoid shared memory OOM
-    print("Disabling Flash Attention (using standard attention to avoid OOM)")
+    print("  ⚠ Disabling Flash Attention (using standard attention to avoid OOM)")
     original_get_device_capability = torch.cuda.get_device_capability
     torch.cuda.get_device_capability = lambda *args, **kwargs: (7, 0)  # Pretend GPU capability < 8
     
     sys.path.insert(0, config.mvpformer.repo_path)
     from models.mvpformer import HMVPFormer
     
-    # Calculate chunk size
     chunk_size = config.data.chunk_size
     full_window = int(config.data.window_size * config.data.sampling_rate)
     num_chunks = full_window // chunk_size
@@ -392,19 +387,23 @@ def main():
     with open(config_path) as f:
         mvp_yaml_config = yaml.safe_load(f)
     
-    # Extract model init_args (Lightning format)
+
     model_args = mvp_yaml_config['model']['init_args']
     
-    print(f"  Building MVPFormer with size_input={chunk_size}")
+    print(f"  Building MVPFormer with size_input={chunk_size}, n_channels=90")
     
-    # Update encoder size_input
-    # encoder is nested: model -> init_args -> encoder -> init_args -> size_input
+
     if 'encoder' not in model_args:
         model_args['encoder'] = {'class_path': 'models.fftencoder.WaveEncoder', 'init_args': {}}
     if 'init_args' not in model_args['encoder']:
         model_args['encoder']['init_args'] = {}
     
     model_args['encoder']['init_args']['size_input'] = chunk_size
+    
+    if 'gpt_config' in model_args:
+        if 'init_args' in model_args['gpt_config']:
+            model_args['gpt_config']['init_args']['n_channels'] = 90
+            print(f"  Modified n_channels: 128 → 90 (balanced channel selection)")
     
     encoder_class_path = model_args['encoder']['class_path']
     encoder_module, encoder_class_name = encoder_class_path.rsplit('.', 1)
@@ -414,17 +413,17 @@ def main():
     EncoderClass = getattr(encoder_module, encoder_class_name)
     
     encoder = EncoderClass(**model_args['encoder']['init_args'])
-    print(f"  Encoder built: {encoder_class_path}")
+    print(f"   Encoder built: {encoder_class_path}")
     
     gpt_config_args = model_args['gpt_config']['init_args']
     from models.mvpformer import MVPFormerConfig
     gpt_config = MVPFormerConfig(**gpt_config_args)
-    print(f"  GPT config built: n_embd={gpt_config.n_embd}, n_layer={gpt_config.n_layer}")
+    print(f"   GPT config built: n_embd={gpt_config.n_embd}, n_layer={gpt_config.n_layer}")
     
     head_args = model_args['head']['init_args']
     from models.mvpformer import MVPFormerHead
     head = MVPFormerHead(**head_args)
-    print(f"  Head built")
+    print(f"   Head built")
     
     hmvp_args = {k: v for k, v in model_args.items() 
                  if k not in ['gpt_config', 'encoder', 'head', 'base_model']}
@@ -436,7 +435,7 @@ def main():
         **hmvp_args
     )
     
-    print(f"MVPFormer built with Standard Attention and chunk_size={chunk_size}")
+    print(f"   MVPFormer built with Standard Attention and chunk_size={chunk_size}")
     
     print(f"  Loading pretrained weights from: {config.mvpformer.checkpoint_path}")
     from mvpformer_utils import load_mvpformer_partial
@@ -446,7 +445,7 @@ def main():
         verbose=True
     )
     
-    print(f"Loaded {stats['loaded_keys']}/{stats['total_keys']} keys ({stats['loaded_keys']/stats['total_keys']*100:.1f}%)")
+    print(f"   Loaded {stats['loaded_keys']}/{stats['total_keys']} keys ({stats['loaded_keys']/stats['total_keys']*100:.1f}%)")
     
     # Freeze all parameters
     mvpformer.eval()
@@ -459,7 +458,6 @@ def main():
     
     torch.cuda.get_device_capability = original_get_device_capability
     
-
     print("\nCreating datasets...")
     train_loader = create_stage1_dataloader(
         data_root=config.data.data_root,
@@ -477,8 +475,8 @@ def main():
         split='val',
     )
     
-    print(f"Train samples: {len(train_loader.dataset)}")
-    print(f"Val samples: {len(val_loader.dataset)}")
+    print(f" Train samples: {len(train_loader.dataset)}")
+    print(f" Val samples: {len(val_loader.dataset)}")
     
 
     print("\nCreating adapter...")
@@ -492,8 +490,9 @@ def main():
     )
     
     n_params = sum(p.numel() for p in adapter.parameters())
-    print(f"Adapter parameters: {n_params:,} ({n_params/1e6:.2f}M)")
+    print(f" Adapter parameters: {n_params:,} ({n_params/1e6:.2f}M)")
     
+
     trainer = Stage1Trainer(
         adapter=adapter,
         train_loader=train_loader,

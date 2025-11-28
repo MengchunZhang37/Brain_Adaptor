@@ -245,7 +245,7 @@ class Stage2Trainer:
         if is_best:
             best_path = self.output_dir / "best_model.pt"
             torch.save(checkpoint, best_path)
-            print(f"✓ Saved best model to {best_path}")
+            print(f"Saved best model to {best_path}")
         
         checkpoints = sorted(self.output_dir.glob("checkpoint_epoch*.pt"))
         if len(checkpoints) > self.config.stage2_training.keep_last_n_checkpoints:
@@ -278,7 +278,7 @@ class Stage2Trainer:
             if epoch % self.config.stage2_training.save_every_n_epochs == 0:
                 self.save_checkpoint(epoch, is_best)
         
-        print(f"\n✓ Training complete!")
+        print(f"\n Training complete!")
         print(f"  Best val loss: {self.best_val_loss:.4f}")
         print(f"  Outputs saved to: {self.output_dir}")
 
