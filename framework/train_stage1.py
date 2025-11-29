@@ -12,29 +12,21 @@ from brain_datasets import create_stage1_dataloader
 from hierarchical_adapter_mvp_llama import SubjectInvariantAdapter
 
 
-# ==================== Loss Functions ====================
-
 class TemporalContrastiveLoss(nn.Module):
     def __init__(self, temperature: float = 0.07):
         super().__init__()
         self.temperature = temperature
     
     def forward(self, anchor, positive, negatives):
-        # anchor, positive: [B, D]
-        # negatives: [B, N, D]
-        
         anchor = nn.functional.normalize(anchor, dim=1)
         positive = nn.functional.normalize(positive, dim=1)
         negatives = nn.functional.normalize(negatives, dim=2)
         
-        # Positive similarity
-        pos_sim = torch.sum(anchor * positive, dim=1) / self.temperature  # [B]
+        pos_sim = torch.sum(anchor * positive, dim=1) / self.temperature
         
-        # Negative similarities
-        neg_sim = torch.bmm(negatives, anchor.unsqueeze(2)).squeeze(2) / self.temperature  # [B, N]
+        neg_sim = torch.bmm(negatives, anchor.unsqueeze(2)).squeeze(2) / self.temperature
         
-        # InfoNCE loss
-        logits = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1)  # [B, 1+N]
+        logits = torch.cat([pos_sim.unsqueeze(1), neg_sim], dim=1)
         labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
         
         loss = nn.functional.cross_entropy(logits, labels)
@@ -47,29 +39,34 @@ class CrossSubjectConsistencyLoss(nn.Module):
         self.method = method
     
     def forward(self, features):
-        # features: [B, n_subjects, D]
+        n_subjects = features.shape[1]
+        
+        if n_subjects < 2:
+            return torch.tensor(0.0, device=features.device)
+        
         if self.method == "cosine":
-            # Pairwise cosine similarity
             features = nn.functional.normalize(features, dim=2)
-            similarity = torch.bmm(features, features.transpose(1, 2))  # [B, n_subjects, n_subjects]
+            similarity = torch.bmm(features, features.transpose(1, 2))
             
-            # Maximize similarity (minimize 1 - similarity)
-            loss = 1.0 - similarity.mean()
+            mask = 1.0 - torch.eye(n_subjects, device=similarity.device)
+            mask = mask.unsqueeze(0)
+            
+            n_off_diag = mask.sum()
+            if n_off_diag == 0:
+                return torch.tensor(0.0, device=features.device)
+            
+            masked_sim = similarity * mask
+            loss = 1.0 - masked_sim.sum() / (n_off_diag * similarity.shape[0])
             return loss
         
         elif self.method == "mmd":
-            # Maximum Mean Discrepancy
-            # Simplified implementation
-            mean_feat = features.mean(dim=1, keepdim=True)  # [B, 1, D]
-            diff = features - mean_feat  # [B, n_subjects, D]
+            mean_feat = features.mean(dim=1, keepdim=True)
+            diff = features - mean_feat
             mmd = (diff ** 2).mean()
             return mmd
 
 
-# ==================== Trainer ====================
-
 class Stage1Trainer:
-    """Stage 1 Trainer"""
     def __init__(
         self,
         adapter: SubjectInvariantAdapter,
@@ -97,7 +94,6 @@ class Stage1Trainer:
             T_max=total_steps
         )
         
-        # Loss functions
         if config.stage1_training.use_temporal_contrastive:
             self.temporal_loss_fn = TemporalContrastiveLoss(
                 temperature=config.stage1_training.temperature
@@ -118,9 +114,10 @@ class Stage1Trainer:
         
         self.global_step = 0
         self.best_val_loss = float('inf')
+        self.best_epoch = 0
+        self.early_stopping_counter = 0
     
     def _init_wandb(self):
-
         run_name = self.config.system.wandb_run_name or self.config.name
         
         wandb.init(
@@ -136,7 +133,7 @@ class Stage1Trainer:
         
         wandb.watch(self.adapter, log='all', log_freq=100)
         
-        print(f" Weights & Biases initialized")
+        print(f"Weights & Biases initialized")
         print(f"  Project: {self.config.system.wandb_project}")
         print(f"  Run: {run_name}")
         if wandb.run:
@@ -167,18 +164,43 @@ class Stage1Trainer:
             loss = 0.0
             losses_dict = {}
             
-            # Temporal contrastive loss
             if self.config.stage1_training.use_temporal_contrastive:
-                # Sample negatives from batch
-                negatives = canonical[torch.randperm(len(canonical))][:self.config.stage1_training.num_negatives]
-                negatives = negatives.unsqueeze(0).expand(len(canonical), -1, -1)
+                batch_size = len(canonical)
+                num_neg = self.config.stage1_training.num_negatives
+                time_indices = batch['time_idx']
+                temporal_margin = 3
+                
+                all_negatives = []
+                for i in range(batch_size):
+                    current_time = time_indices[i].item()
+                    
+                    time_diff = torch.abs(time_indices.float() - current_time)
+                    valid_mask = time_diff > temporal_margin
+                    
+                    candidates = canonical[valid_mask]
+                    
+                    if len(candidates) >= num_neg:
+                        perm = torch.randperm(len(candidates), device=canonical.device)[:num_neg]
+                        neg_samples = candidates[perm]
+                    else:
+                        if len(candidates) > 0:
+                            repeat_times = (num_neg // len(candidates)) + 1
+                            expanded = candidates.repeat(repeat_times, 1)
+                            perm = torch.randperm(len(expanded), device=canonical.device)[:num_neg]
+                            neg_samples = expanded[perm]
+                        else:
+                            perm = torch.randperm(batch_size, device=canonical.device)[:num_neg]
+                            neg_samples = canonical[perm]
+                    
+                    all_negatives.append(neg_samples)
+                
+                negatives = torch.stack(all_negatives)
                 
                 temporal_loss = self.temporal_loss_fn(canonical, canonical_pos, negatives)
                 loss += self.config.stage1_training.temporal_weight * temporal_loss
                 losses_dict['temporal'] = temporal_loss.item()
                 total_temporal += temporal_loss.item()
             
-            # Cross-subject consistency loss
             if self.config.stage1_training.use_cross_subject_consistency:
                 consistency_loss = self.consistency_loss_fn(canonical_cross)
                 loss += self.config.stage1_training.consistency_weight * consistency_loss
@@ -194,7 +216,7 @@ class Stage1Trainer:
             )
             
             self.optimizer.step()
-            self.scheduler.step()  
+            self.scheduler.step()
             
             total_loss += loss.item()
             self.global_step += 1
@@ -234,6 +256,9 @@ class Stage1Trainer:
         self.adapter.eval()
         
         total_loss = 0.0
+        total_temporal = 0.0
+        total_consistency = 0.0
+        n_batches = 0
         
         with torch.no_grad():
             for batch in tqdm(self.val_loader, desc="Validating"):
@@ -242,28 +267,79 @@ class Stage1Trainer:
                 
                 canonical = self.adapter(feature)
                 
-                # Cross-subject features
                 batch_size, n_subjects, feat_dim = cross_subject_group.shape
                 cross_subject_flat = cross_subject_group.view(-1, feat_dim)
                 canonical_cross = self.adapter(cross_subject_flat)
                 canonical_cross = canonical_cross.view(batch_size, n_subjects, -1)
                 
-                # Consistency loss (main validation metric)
+                loss = 0.0
+                
+                if 'temporal_positive' in batch and self.config.stage1_training.use_temporal_contrastive:
+                    temporal_positive = batch['temporal_positive'].to(self.device)
+                    canonical_pos = self.adapter(temporal_positive)
+                    
+                    batch_size = len(canonical)
+                    num_neg = self.config.stage1_training.num_negatives
+                    time_indices = batch['time_idx']
+                    temporal_margin = 3
+                    
+                    all_negatives = []
+                    for i in range(batch_size):
+                        current_time = time_indices[i].item()
+                        time_diff = torch.abs(time_indices.float() - current_time)
+                        valid_mask = time_diff > temporal_margin
+                        candidates = canonical[valid_mask]
+                        
+                        if len(candidates) >= num_neg:
+                            perm = torch.randperm(len(candidates), device=canonical.device)[:num_neg]
+                            neg_samples = candidates[perm]
+                        else:
+                            if len(candidates) > 0:
+                                repeat_times = (num_neg // len(candidates)) + 1
+                                expanded = candidates.repeat(repeat_times, 1)
+                                perm = torch.randperm(len(expanded), device=canonical.device)[:num_neg]
+                                neg_samples = expanded[perm]
+                            else:
+                                perm = torch.randperm(batch_size, device=canonical.device)[:num_neg]
+                                neg_samples = canonical[perm]
+                        
+                        all_negatives.append(neg_samples)
+                    
+                    negatives = torch.stack(all_negatives)
+                    
+                    temporal_loss = self.temporal_loss_fn(canonical, canonical_pos, negatives)
+                    loss += self.config.stage1_training.temporal_weight * temporal_loss
+                    total_temporal += temporal_loss.item()
+                
                 if self.config.stage1_training.use_cross_subject_consistency:
-                    loss = self.consistency_loss_fn(canonical_cross)
-                    total_loss += loss.item()
+                    consistency_loss = self.consistency_loss_fn(canonical_cross)
+                    loss += self.config.stage1_training.consistency_weight * consistency_loss
+                    total_consistency += consistency_loss.item()
+                
+                total_loss += loss.item() if isinstance(loss, torch.Tensor) else loss
+                n_batches += 1
         
-        avg_loss = total_loss / len(self.val_loader)
+        avg_loss = total_loss / n_batches if n_batches > 0 else 0
+        avg_temporal = total_temporal / n_batches if n_batches > 0 else 0
+        avg_consistency = total_consistency / n_batches if n_batches > 0 else 0
         
         self.writer.add_scalar('val/loss', avg_loss, epoch)
+        self.writer.add_scalar('val/temporal', avg_temporal, epoch)
+        self.writer.add_scalar('val/consistency', avg_consistency, epoch)
         
         if self.config.system.use_wandb:
             wandb.log({
                 'val/loss': avg_loss,
+                'val/temporal': avg_temporal,
+                'val/consistency': avg_consistency,
                 'epoch': epoch,
             }, step=self.global_step)
         
-        return {'val_loss': avg_loss}
+        return {
+            'val_loss': avg_loss,
+            'val_temporal': avg_temporal,
+            'val_consistency': avg_consistency
+        }
     
     def save_checkpoint(self, epoch: int, is_best: bool = False):
         checkpoint = {
@@ -280,7 +356,7 @@ class Stage1Trainer:
         if is_best:
             best_path = self.output_dir / "best_model.pt"
             torch.save(checkpoint, best_path)
-            print(f" Saved best model to {best_path}")
+            print(f"Saved best model to {best_path}")
         
         checkpoints = sorted(self.output_dir.glob("checkpoint_epoch*.pt"))
         if len(checkpoints) > self.config.stage1_training.keep_last_n_checkpoints:
@@ -293,8 +369,8 @@ class Stage1Trainer:
         print(f"{'='*70}\n")
         
         for epoch in range(1, self.config.stage1_training.num_epochs + 1):
-
             train_metrics = self.train_epoch(epoch)
+            
             val_metrics = self.validate(epoch)
             
             print(f"\nEpoch {epoch}/{self.config.stage1_training.num_epochs}")
@@ -302,6 +378,8 @@ class Stage1Trainer:
             print(f"    Temporal: {train_metrics['temporal_loss']:.4f}")
             print(f"    Consistency: {train_metrics['consistency_loss']:.4f}")
             print(f"  Val Loss: {val_metrics['val_loss']:.4f}")
+            print(f"    Temporal: {val_metrics['val_temporal']:.4f}")
+            print(f"    Consistency: {val_metrics['val_consistency']:.4f}")
             
             if self.config.system.use_wandb:
                 wandb.log({
@@ -309,30 +387,43 @@ class Stage1Trainer:
                     'epoch_metrics/train_temporal': train_metrics['temporal_loss'],
                     'epoch_metrics/train_consistency': train_metrics['consistency_loss'],
                     'epoch_metrics/val_loss': val_metrics['val_loss'],
+                    'epoch_metrics/val_temporal': val_metrics['val_temporal'],
+                    'epoch_metrics/val_consistency': val_metrics['val_consistency'],
                     'epoch': epoch,
                 }, step=self.global_step)
             
-            is_best = val_metrics['val_loss'] < self.best_val_loss
+            is_best = val_metrics['val_loss'] < (self.best_val_loss - self.config.stage1_training.early_stopping_min_delta)
             if is_best:
                 self.best_val_loss = val_metrics['val_loss']
+                self.best_epoch = epoch
+                self.early_stopping_counter = 0
+                print(f"  New best model! (val_loss: {self.best_val_loss:.4f})")
+                
+                self.save_checkpoint(epoch, is_best=True)
                 
                 if self.config.system.use_wandb:
                     wandb.run.summary['best_val_loss'] = self.best_val_loss
                     wandb.run.summary['best_epoch'] = epoch
+            else:
+                if self.config.stage1_training.early_stopping:
+                    self.early_stopping_counter += 1
+                    if self.early_stopping_counter >= self.config.stage1_training.early_stopping_patience:
+                        print(f"\nEarly stopping triggered! No improvement for {self.early_stopping_counter} epochs.")
+                        print(f"  Best val loss: {self.best_val_loss:.4f} (epoch {self.best_epoch})")
+                        break
             
             if epoch % self.config.stage1_training.save_every_n_epochs == 0:
-                self.save_checkpoint(epoch, is_best)
+                self.save_checkpoint(epoch, is_best=False)
         
-        print(f"\n Training complete!")
-        print(f"  Best val loss: {self.best_val_loss:.4f}")
+        print(f"\nTraining complete!")
+        print(f"  Best val loss: {self.best_val_loss:.4f} (epoch {self.best_epoch})")
+        print(f"  Best model saved to: {self.output_dir / 'best_model.pt'}")
         print(f"  Outputs saved to: {self.output_dir}")
         
         if self.config.system.use_wandb:
             wandb.finish()
         print(f"  Outputs saved to: {self.output_dir}")
 
-
-# ==================== Main ====================
 
 def main():
     parser = argparse.ArgumentParser(description="Stage 1 Training")
@@ -353,6 +444,7 @@ def main():
     config.mvpformer.checkpoint_path = args.mvpformer_checkpoint
     
     print(f"Loaded config: {args.config}")
+    print(f"Split seed: {config.data.split_seed}")
     print(f"Key ablation settings:")
     print(f"  use_temporal_contrastive: {config.stage1_training.use_temporal_contrastive}")
     print(f"  use_cross_subject_consistency: {config.stage1_training.use_cross_subject_consistency}")
@@ -364,10 +456,9 @@ def main():
     
     print("\nLoading MVPFormer...")
     
-    # Disable Flash Attention to avoid shared memory OOM
-    print("  ⚠ Disabling Flash Attention (using standard attention to avoid OOM)")
+    print("  Disabling Flash Attention (using standard attention to avoid OOM)")
     original_get_device_capability = torch.cuda.get_device_capability
-    torch.cuda.get_device_capability = lambda *args, **kwargs: (7, 0)  # Pretend GPU capability < 8
+    torch.cuda.get_device_capability = lambda *args, **kwargs: (7, 0)
     
     sys.path.insert(0, config.mvpformer.repo_path)
     from models.mvpformer import HMVPFormer
@@ -379,20 +470,17 @@ def main():
     print(f"  Full window: {config.data.window_size}s × {config.data.sampling_rate}Hz = {full_window} samples")
     print(f"  Processing in {num_chunks} chunks of {chunk_size} samples each")
     
-    # Build MVPFormer from scratch with correct chunk_size
-    import yaml
+    import yaml as _yaml
     config_path = Path(config.mvpformer.repo_path) / "configs" / "mvpformer_generative.yaml"
     
     print(f"  Loading config from: {config_path}")
     with open(config_path) as f:
-        mvp_yaml_config = yaml.safe_load(f)
+        mvp_yaml_config = _yaml.safe_load(f)
     
-
     model_args = mvp_yaml_config['model']['init_args']
     
     print(f"  Building MVPFormer with size_input={chunk_size}, n_channels=90")
     
-
     if 'encoder' not in model_args:
         model_args['encoder'] = {'class_path': 'models.fftencoder.WaveEncoder', 'init_args': {}}
     if 'init_args' not in model_args['encoder']:
@@ -413,17 +501,17 @@ def main():
     EncoderClass = getattr(encoder_module, encoder_class_name)
     
     encoder = EncoderClass(**model_args['encoder']['init_args'])
-    print(f"   Encoder built: {encoder_class_path}")
+    print(f"  Encoder built: {encoder_class_path}")
     
     gpt_config_args = model_args['gpt_config']['init_args']
     from models.mvpformer import MVPFormerConfig
     gpt_config = MVPFormerConfig(**gpt_config_args)
-    print(f"   GPT config built: n_embd={gpt_config.n_embd}, n_layer={gpt_config.n_layer}")
+    print(f"  GPT config built: n_embd={gpt_config.n_embd}, n_layer={gpt_config.n_layer}")
     
     head_args = model_args['head']['init_args']
     from models.mvpformer import MVPFormerHead
     head = MVPFormerHead(**head_args)
-    print(f"   Head built")
+    print(f"  Head built")
     
     hmvp_args = {k: v for k, v in model_args.items() 
                  if k not in ['gpt_config', 'encoder', 'head', 'base_model']}
@@ -435,7 +523,7 @@ def main():
         **hmvp_args
     )
     
-    print(f"   MVPFormer built with Standard Attention and chunk_size={chunk_size}")
+    print(f"  MVPFormer built with Standard Attention and chunk_size={chunk_size}")
     
     print(f"  Loading pretrained weights from: {config.mvpformer.checkpoint_path}")
     from mvpformer_utils import load_mvpformer_partial
@@ -445,9 +533,8 @@ def main():
         verbose=True
     )
     
-    print(f"   Loaded {stats['loaded_keys']}/{stats['total_keys']} keys ({stats['loaded_keys']/stats['total_keys']*100:.1f}%)")
+    print(f"  Loaded {stats['loaded_keys']}/{stats['total_keys']} keys ({stats['loaded_keys']/stats['total_keys']*100:.1f}%)")
     
-    # Freeze all parameters
     mvpformer.eval()
     for param in mvpformer.parameters():
         param.requires_grad = False
@@ -475,10 +562,9 @@ def main():
         split='val',
     )
     
-    print(f" Train samples: {len(train_loader.dataset)}")
-    print(f" Val samples: {len(val_loader.dataset)}")
+    print(f"Train samples: {len(train_loader.dataset)}")
+    print(f"Val samples: {len(val_loader.dataset)}")
     
-
     print("\nCreating adapter...")
     adapter = SubjectInvariantAdapter(
         mvpformer_dim=config.adapter.mvpformer_dim,
@@ -490,9 +576,8 @@ def main():
     )
     
     n_params = sum(p.numel() for p in adapter.parameters())
-    print(f" Adapter parameters: {n_params:,} ({n_params/1e6:.2f}M)")
+    print(f"Adapter parameters: {n_params:,} ({n_params/1e6:.2f}M)")
     
-
     trainer = Stage1Trainer(
         adapter=adapter,
         train_loader=train_loader,
