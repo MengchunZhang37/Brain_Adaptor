@@ -771,7 +771,7 @@ def main():
     full_window = int(config.data.window_size * config.data.sampling_rate)
     num_chunks = full_window // chunk_size
     
-    print(f"  Full window: {config.data.window_size}s × {config.data.sampling_rate}Hz = {full_window} samples")
+    print(f"  Full window: {config.data.window_size}s x {config.data.sampling_rate}Hz = {full_window} samples")
     print(f"  Processing in {num_chunks} chunks of {chunk_size} samples each")
     
     import yaml
@@ -795,7 +795,7 @@ def main():
     if 'gpt_config' in model_args:
         if 'init_args' in model_args['gpt_config']:
             model_args['gpt_config']['init_args']['n_channels'] = 90
-            print(f"  Modified n_channels: 128 → 90 (balanced channel selection)")
+            print(f"  Modified n_channels: 128 to 90 (balanced channel selection)")
     
     encoder_class_path = model_args['encoder']['class_path']
     encoder_module, encoder_class_name = encoder_class_path.rsplit('.', 1)
@@ -872,44 +872,53 @@ def main():
     probe_data = None
     if config.stage1_training.use_downstream_probe:
         print("\nLoading probe data (word embeddings)...")
-        try:
-            import pandas as pd
-            import numpy as np
-            
-            embeddings_path = Path(config.data.data_root) / config.linguistic.embeddings_file
-            word_embeddings = np.load(embeddings_path)
-            print(f"  Loaded word embeddings: {word_embeddings.shape}")
-            
-            val_dataset = val_loader.dataset
-            n_probe_samples = min(500, len(val_dataset))
-            
-            probe_brain_features = []
-            probe_word_embeddings = []
-            
-            sample_indices = torch.randperm(len(val_dataset))[:n_probe_samples]
-            
-            for idx in sample_indices:
-                sample = val_dataset[idx.item()]
-                probe_brain_features.append(sample['feature'])
-                
-                time_idx = sample['time_idx']
-                if time_idx < len(word_embeddings):
-                    probe_word_embeddings.append(torch.from_numpy(word_embeddings[time_idx]).float())
-            
-            if len(probe_word_embeddings) > 0:
-                probe_data = {
-                    'brain_features': torch.stack(probe_brain_features),
-                    'word_embeddings': torch.stack(probe_word_embeddings),
-                }
-                print(f"  Probe data ready: {len(probe_brain_features)} samples")
-            else:
-                print("  Could not prepare probe data, skipping probe evaluation")
-                config.stage1_training.use_downstream_probe = False
-                
-        except Exception as e:
-            print(f"  Could not load probe data: {e}")
-            print("  Disabling downstream probe evaluation")
+        
+        embeddings_path = Path(config.data.data_root).parent / config.linguistic.embeddings_file
+        print(f"  Expected path: {embeddings_path}")
+        
+        if not embeddings_path.exists():
+            print(f"  File NOT FOUND!")
+            print(f"  Please ensure word embeddings file exists at:")
+            print(f"    {embeddings_path}")
+            print(f"  Disabling downstream probe...")
             config.stage1_training.use_downstream_probe = False
+        else:
+            try:
+                import numpy as np
+                
+                word_embeddings = np.load(embeddings_path)
+                print(f"  Loaded word embeddings: {word_embeddings.shape}")
+                
+                val_dataset = val_loader.dataset
+                n_probe_samples = min(500, len(val_dataset))
+                
+                probe_brain_features = []
+                probe_word_embeddings = []
+                
+                sample_indices = torch.randperm(len(val_dataset))[:n_probe_samples]
+                
+                for idx in sample_indices:
+                    sample = val_dataset[idx.item()]
+                    probe_brain_features.append(sample['feature'])
+                    
+                    time_idx = sample['time_idx']
+                    if time_idx < len(word_embeddings):
+                        probe_word_embeddings.append(torch.from_numpy(word_embeddings[time_idx]).float())
+                
+                if len(probe_word_embeddings) > 0:
+                    probe_data = {
+                        'brain_features': torch.stack(probe_brain_features),
+                        'word_embeddings': torch.stack(probe_word_embeddings),
+                    }
+                    print(f"  Probe data ready: {len(probe_brain_features)} samples")
+                else:
+                    print("  Could not prepare probe data, skipping probe evaluation")
+                    config.stage1_training.use_downstream_probe = False
+                    
+            except Exception as e:
+                print(f"  Error loading probe data: {e}")
+                print("  Disabling downstream probe...")
+                config.stage1_training.use_downstream_probe = False
     
     print("\nCreating adapter...")
     adapter = SubjectInvariantAdapter(
