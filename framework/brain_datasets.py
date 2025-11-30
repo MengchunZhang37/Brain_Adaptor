@@ -355,16 +355,48 @@ class PodcastLinguisticDataset(Dataset):
         print(f"  Transcript and embeddings matched!")
     
     def _align_features(self):
+        has_start_end = 'start' in self.words_df.columns and 'end' in self.words_df.columns
         has_onset = 'onset' in self.words_df.columns or 'word_onset' in self.words_df.columns
         
-        if has_onset:
+        if has_start_end:
+            print("  Using time-based alignment (start/end columns found)")
+            self._align_by_start_end()
+        elif has_onset:
             print("  Using time-based alignment (onset column found)")
             self._align_by_time()
         else:
-            print("  Using sequence-based alignment (no onset column)")
+            print("  Using sequence-based alignment (no timing columns)")
             self._align_by_sequence()
         
         print(f"  Created {len(self.aligned_pairs)} aligned pairs")
+    
+    def _align_by_start_end(self):
+        self.aligned_pairs = []
+        
+        window_size = self.config.data.window_size
+        stride = self.config.data.stride
+        
+        for idx, row in self.words_df.iterrows():
+            word_start = row['start']
+            word_end = row['end']
+            word_center = (word_start + word_end) / 2
+            word_idx = idx
+            
+            window_idx = int((word_center - window_size / 2) / stride)
+            window_idx = max(0, window_idx)
+            
+            for subj_id in self.subjects:
+                if subj_id in self.canonical_features:
+                    n_windows = len(self.canonical_features[subj_id])
+                    if 0 <= window_idx < n_windows:
+                        self.aligned_pairs.append({
+                            'subject_id': subj_id,
+                            'brain_idx': window_idx,
+                            'word_idx': word_idx,
+                            'word': row['word'],
+                            'start': word_start,
+                            'end': word_end,
+                        })
     
     def _align_by_time(self):
         onset_col = 'onset' if 'onset' in self.words_df.columns else 'word_onset'
