@@ -267,7 +267,7 @@ class Stage1Trainer:
         
         wandb.watch(self.adapter, log='all', log_freq=100)
         
-        print(f"✓ Weights & Biases initialized")
+        print(f"Weights & Biases initialized")
         print(f"  Project: {self.config.system.wandb_project}")
         print(f"  Run: {run_name}")
         if wandb.run:
@@ -288,9 +288,9 @@ class Stage1Trainer:
             if epoch <= phase1_epochs:
                 use_cross_subject = False
                 if epoch == 1:
-                    print(f"  📚 Curriculum Phase 1 (epoch 1-{phase1_epochs}): Only temporal loss")
+                    print(f"  Curriculum Phase 1 (epoch 1-{phase1_epochs}): Only temporal loss")
             elif epoch == phase1_epochs + 1:
-                print(f"  📚 Curriculum Phase 2 (epoch {phase1_epochs+1}+): Adding cross-subject losses")
+                print(f"  Curriculum Phase 2 (epoch {phase1_epochs+1}+): Adding cross-subject losses")
         
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}")
         
@@ -590,49 +590,50 @@ class Stage1Trainer:
             'val_consistency': avg_consistency
         }
     
-    def save_checkpoint(self, epoch: int, is_best: bool = False, is_best_probe: bool = False):
+    def save_checkpoint(self, epoch: int, is_best_probe: bool = False):
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.adapter.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'config': self.config.to_dict(),
             'global_step': self.global_step,
+            'best_probe_cosine': self.best_probe_cosine,
         }
         
-        path = self.output_dir / f"checkpoint_epoch{epoch}.pt"
-        torch.save(checkpoint, path)
-        
-        if is_best:
+        if is_best_probe:
             best_path = self.output_dir / "best_model.pt"
             torch.save(checkpoint, best_path)
-            print(f"  ✓ Saved best model (val_loss) to {best_path}")
+            print(f"  Saved best model (probe_cosine={self.best_probe_cosine:.4f}) to {best_path}")
         
-        if is_best_probe:
-            best_probe_path = self.output_dir / "best_model_probe.pt"
-            torch.save(checkpoint, best_probe_path)
-            print(f"  ✓ Saved best model (probe) to {best_probe_path}")
-        
-        checkpoints = sorted(self.output_dir.glob("checkpoint_epoch*.pt"))
-        if len(checkpoints) > self.config.stage1_training.keep_last_n_checkpoints:
-            for ckpt in checkpoints[:-self.config.stage1_training.keep_last_n_checkpoints]:
-                ckpt.unlink()
+        if epoch % self.config.stage1_training.save_every_n_epochs == 0:
+            path = self.output_dir / f"checkpoint_epoch{epoch}.pt"
+            torch.save(checkpoint, path)
+            
+            checkpoints = sorted(self.output_dir.glob("checkpoint_epoch*.pt"))
+            if len(checkpoints) > self.config.stage1_training.keep_last_n_checkpoints:
+                for ckpt in checkpoints[:-self.config.stage1_training.keep_last_n_checkpoints]:
+                    ckpt.unlink()
     
     def train(self):
         print(f"\n{'='*70}")
         print(f"Starting Stage 1 Training: {self.config.name}")
         print(f"{'='*70}")
         
-        print(f"\n📋 Loss Configuration:")
+        print(f"\nLoss Configuration:")
         print(f"  Temporal Contrastive: {self.config.stage1_training.use_temporal_contrastive} (weight={self.config.stage1_training.temporal_weight})")
         print(f"  Cosine Consistency:   {self.config.stage1_training.use_cross_subject_consistency} (weight={self.config.stage1_training.consistency_weight})")
         print(f"  Cross-Subject InfoNCE:{self.config.stage1_training.use_cross_subject_infonce} (weight={self.config.stage1_training.infonce_weight})")
         print(f"  MMD:                  {self.config.stage1_training.use_mmd} (weight={self.config.stage1_training.mmd_weight})")
         
         if self.config.stage1_training.use_curriculum:
-            print(f"\n📚 Curriculum Learning: Phase 1 (temporal only) for {self.config.stage1_training.curriculum_phase1_epochs} epochs")
+            print(f"\nCurriculum Learning: Phase 1 (temporal only) for {self.config.stage1_training.curriculum_phase1_epochs} epochs")
         
-        if self.config.stage1_training.use_downstream_probe:
-            print(f"\n🔬 Downstream Probe: Every {self.config.stage1_training.probe_every_n_epochs} epochs")
+        if self.config.stage1_training.use_downstream_probe and self.probe_data is not None:
+            print(f"\nDownstream Probe: Every {self.config.stage1_training.probe_every_n_epochs} epoch(s)")
+            print(f"   best_model.pt will be saved based on probe_cosine (alignment metric)")
+        else:
+            print(f"\nDownstream Probe: Disabled (no probe data)")
+            print(f"   best_model.pt will be saved based on val_temporal")
         
         print()
         
@@ -651,27 +652,30 @@ class Stage1Trainer:
             if train_metrics.get('mmd_loss', 0) > 0:
                 print(f"    MMD:         {train_metrics['mmd_loss']:.4f}")
             
-            print(f"  Val Loss: {val_metrics['val_loss']:.4f}")
-            print(f"    Temporal:    {val_metrics['val_temporal']:.4f}")
-            if val_metrics.get('val_consistency', 0) > 0:
-                print(f"    Consistency: {val_metrics['val_consistency']:.4f}")
-            if val_metrics.get('val_infonce', 0) > 0:
-                print(f"    InfoNCE:     {val_metrics['val_infonce']:.4f}")
-            if val_metrics.get('val_mmd', 0) > 0:
-                print(f"    MMD:         {val_metrics['val_mmd']:.4f}")
+            print(f"  Val Temporal: {val_metrics['val_temporal']:.4f}")
             
             probe_metrics = None
             is_best_probe = False
+            
             if self.config.stage1_training.use_downstream_probe and \
+               self.probe_data is not None and \
                epoch % self.config.stage1_training.probe_every_n_epochs == 0:
                 probe_metrics = self.run_downstream_probe(epoch)
                 if probe_metrics:
-                    print(f"  🔬 Probe: cosine={probe_metrics['cosine_similarity']:.4f}, mse={probe_metrics['mse']:.4f}")
+                    print(f"  Probe: cosine={probe_metrics['cosine_similarity']:.4f}, mse={probe_metrics['mse']:.4f}")
                     
                     if probe_metrics['cosine_similarity'] > self.best_probe_cosine:
                         self.best_probe_cosine = probe_metrics['cosine_similarity']
+                        self.best_epoch = epoch
                         is_best_probe = True
-                        print(f"  ★ New best probe! (cosine: {self.best_probe_cosine:.4f})")
+                        print(f"  New best! (probe_cosine: {self.best_probe_cosine:.4f})")
+            
+            if self.probe_data is None:
+                if val_metrics['val_temporal'] < self.best_val_loss:
+                    self.best_val_loss = val_metrics['val_temporal']
+                    self.best_epoch = epoch
+                    is_best_probe = True
+                    print(f"  New best! (val_temporal: {self.best_val_loss:.4f})")
             
             if self.config.system.use_wandb:
                 log_dict = {
@@ -682,49 +686,44 @@ class Stage1Trainer:
                     'epoch': epoch,
                 }
                 
-                for key in ['consistency_loss', 'infonce_loss', 'mmd_loss']:
-                    if train_metrics.get(key, 0) > 0:
-                        log_dict[f'epoch_metrics/train_{key.replace("_loss", "")}'] = train_metrics[key]
+                if train_metrics.get('consistency_loss', 0) > 0:
+                    log_dict['epoch_metrics/train_consistency'] = train_metrics['consistency_loss']
+                if train_metrics.get('infonce_loss', 0) > 0:
+                    log_dict['epoch_metrics/train_infonce'] = train_metrics['infonce_loss']
+                if train_metrics.get('mmd_loss', 0) > 0:
+                    log_dict['epoch_metrics/train_mmd'] = train_metrics['mmd_loss']
                 
-                for key in ['val_consistency', 'val_infonce', 'val_mmd']:
-                    if val_metrics.get(key, 0) > 0:
-                        log_dict[f'epoch_metrics/{key}'] = val_metrics[key]
+                if val_metrics.get('val_consistency', 0) > 0:
+                    log_dict['epoch_metrics/val_consistency'] = val_metrics['val_consistency']
+                if val_metrics.get('val_infonce', 0) > 0:
+                    log_dict['epoch_metrics/val_infonce'] = val_metrics['val_infonce']
+                if val_metrics.get('val_mmd', 0) > 0:
+                    log_dict['epoch_metrics/val_mmd'] = val_metrics['val_mmd']
                 
                 if probe_metrics:
                     log_dict['epoch_metrics/probe_cosine'] = probe_metrics['cosine_similarity']
                     log_dict['epoch_metrics/probe_mse'] = probe_metrics['mse']
                 
                 wandb.log(log_dict, step=self.global_step)
-            
-            is_best = val_metrics['val_temporal'] < (self.best_val_loss - self.config.stage1_training.early_stopping_min_delta)
-            if is_best:
-                self.best_val_loss = val_metrics['val_temporal']
-                self.best_epoch = epoch
-                self.early_stopping_counter = 0
-                print(f"  ★ New best model! (val_temporal: {self.best_val_loss:.4f})")
                 
-                if self.config.system.use_wandb:
-                    wandb.run.summary['best_val_temporal'] = self.best_val_loss
-                    wandb.run.summary['best_epoch'] = epoch
-            else:
-                if self.config.stage1_training.early_stopping:
-                    self.early_stopping_counter += 1
-                    if self.early_stopping_counter >= self.config.stage1_training.early_stopping_patience:
-                        print(f"\n⚠ Early stopping triggered! No improvement for {self.early_stopping_counter} epochs.")
-                        print(f"  Best val_temporal: {self.best_val_loss:.4f} (epoch {self.best_epoch})")
-                        break
+                if is_best_probe:
+                    if self.probe_data is not None:
+                        wandb.run.summary['best_probe_cosine'] = self.best_probe_cosine
+                    else:
+                        wandb.run.summary['best_val_temporal'] = self.best_val_loss
+                    wandb.run.summary['best_epoch'] = self.best_epoch
             
-            if is_best or is_best_probe:
-                self.save_checkpoint(epoch, is_best=is_best, is_best_probe=is_best_probe)
-            
-            if epoch % self.config.stage1_training.save_every_n_epochs == 0:
-                self.save_checkpoint(epoch, is_best=False, is_best_probe=False)
+            self.save_checkpoint(epoch, is_best_probe=is_best_probe)
         
-        print(f"\n✓ Training complete!")
-        print(f"  Best val_temporal: {self.best_val_loss:.4f} (epoch {self.best_epoch})")
-        if self.best_probe_cosine > -float('inf'):
-            print(f"  Best probe cosine: {self.best_probe_cosine:.4f}")
-        print(f"  Outputs saved to: {self.output_dir}")
+        print(f"\n{'='*70}")
+        print(f"Training complete!")
+        print(f"{'='*70}")
+        if self.probe_data is not None:
+            print(f"  Best probe_cosine: {self.best_probe_cosine:.4f} (epoch {self.best_epoch})")
+        else:
+            print(f"  Best val_temporal: {self.best_val_loss:.4f} (epoch {self.best_epoch})")
+        print(f"  Best model: {self.output_dir / 'best_model.pt'}")
+        print(f"  Outputs: {self.output_dir}")
         
         if self.config.system.use_wandb:
             wandb.finish()
@@ -761,7 +760,7 @@ def main():
     
     print("\nLoading MVPFormer...")
     
-    print("  ⚠ Disabling Flash Attention (using standard attention to avoid OOM)")
+    print("  Disabling Flash Attention (using standard attention to avoid OOM)")
     original_get_device_capability = torch.cuda.get_device_capability
     torch.cuda.get_device_capability = lambda *args, **kwargs: (7, 0)
     
@@ -806,17 +805,17 @@ def main():
     EncoderClass = getattr(encoder_module, encoder_class_name)
     
     encoder = EncoderClass(**model_args['encoder']['init_args'])
-    print(f"  ✓ Encoder built: {encoder_class_path}")
+    print(f"  Encoder built: {encoder_class_path}")
     
     gpt_config_args = model_args['gpt_config']['init_args']
     from models.mvpformer import MVPFormerConfig
     gpt_config = MVPFormerConfig(**gpt_config_args)
-    print(f"  ✓ GPT config built: n_embd={gpt_config.n_embd}, n_layer={gpt_config.n_layer}")
+    print(f"  GPT config built: n_embd={gpt_config.n_embd}, n_layer={gpt_config.n_layer}")
     
     head_args = model_args['head']['init_args']
     from models.mvpformer import MVPFormerHead
     head = MVPFormerHead(**head_args)
-    print(f"  ✓ Head built")
+    print(f"  Head built")
     
     hmvp_args = {k: v for k, v in model_args.items() 
                  if k not in ['gpt_config', 'encoder', 'head', 'base_model']}
@@ -828,7 +827,7 @@ def main():
         **hmvp_args
     )
     
-    print(f"  ✓ MVPFormer built with Standard Attention and chunk_size={chunk_size}")
+    print(f"  MVPFormer built with Standard Attention and chunk_size={chunk_size}")
     
     print(f"  Loading pretrained weights from: {config.mvpformer.checkpoint_path}")
     from mvpformer_utils import load_mvpformer_partial
@@ -838,7 +837,7 @@ def main():
         verbose=True
     )
     
-    print(f"  ✓ Loaded {stats['loaded_keys']}/{stats['total_keys']} keys ({stats['loaded_keys']/stats['total_keys']*100:.1f}%)")
+    print(f"  Loaded {stats['loaded_keys']}/{stats['total_keys']} keys ({stats['loaded_keys']/stats['total_keys']*100:.1f}%)")
     
     mvpformer.eval()
     for param in mvpformer.parameters():
@@ -867,8 +866,8 @@ def main():
         split='val',
     )
     
-    print(f"✓ Train samples: {len(train_loader.dataset)}")
-    print(f"✓ Val samples: {len(val_loader.dataset)}")
+    print(f"Train samples: {len(train_loader.dataset)}")
+    print(f"Val samples: {len(val_loader.dataset)}")
     
     probe_data = None
     if config.stage1_training.use_downstream_probe:
@@ -879,7 +878,7 @@ def main():
             
             embeddings_path = Path(config.data.data_root) / config.linguistic.embeddings_file
             word_embeddings = np.load(embeddings_path)
-            print(f"  ✓ Loaded word embeddings: {word_embeddings.shape}")
+            print(f"  Loaded word embeddings: {word_embeddings.shape}")
             
             val_dataset = val_loader.dataset
             n_probe_samples = min(500, len(val_dataset))
@@ -902,14 +901,14 @@ def main():
                     'brain_features': torch.stack(probe_brain_features),
                     'word_embeddings': torch.stack(probe_word_embeddings),
                 }
-                print(f"  ✓ Probe data ready: {len(probe_brain_features)} samples")
+                print(f"  Probe data ready: {len(probe_brain_features)} samples")
             else:
-                print("  ⚠ Could not prepare probe data, skipping probe evaluation")
+                print("  Could not prepare probe data, skipping probe evaluation")
                 config.stage1_training.use_downstream_probe = False
                 
         except Exception as e:
-            print(f"  ⚠ Could not load probe data: {e}")
-            print("  ⚠ Disabling downstream probe evaluation")
+            print(f"  Could not load probe data: {e}")
+            print("  Disabling downstream probe evaluation")
             config.stage1_training.use_downstream_probe = False
     
     print("\nCreating adapter...")
@@ -923,7 +922,7 @@ def main():
     )
     
     n_params = sum(p.numel() for p in adapter.parameters())
-    print(f"✓ Adapter parameters: {n_params:,} ({n_params/1e6:.2f}M)")
+    print(f"Adapter parameters: {n_params:,} ({n_params/1e6:.2f}M)")
     
     trainer = Stage1Trainer(
         adapter=adapter,
