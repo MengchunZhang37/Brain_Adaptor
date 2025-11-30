@@ -43,15 +43,20 @@ class AdapterConfig:
 class Stage1TrainingConfig:
     temporal_weight: float = 1.0
     consistency_weight: float = 2.5
+    infonce_weight: float = 0.0
+    mmd_weight: float = 0.0
     masked_weight: float = 0.0
     use_temporal_contrastive: bool = True
     use_cross_subject_consistency: bool = True
+    use_cross_subject_infonce: bool = False
+    use_mmd: bool = False
     use_masked_modeling: bool = False
-    consistency_method: str = "cosine"
+    use_curriculum: bool = False
+    curriculum_phase1_epochs: int = 30
     temperature: float = 0.07
     num_negatives: int = 16
     mask_ratio: float = 0.15
-    num_epochs: int = 50
+    num_epochs: int = 100
     batch_size: int = 64
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
@@ -62,9 +67,14 @@ class Stage1TrainingConfig:
     accumulation_steps: int = 1
     save_every_n_epochs: int = 5
     keep_last_n_checkpoints: int = 3
-    early_stopping: bool = True
+    early_stopping: bool = False
     early_stopping_patience: int = 10
     early_stopping_min_delta: float = 0.001
+    use_downstream_probe: bool = True
+    probe_every_n_epochs: int = 5
+    probe_train_epochs: int = 1
+    probe_lr: float = 1e-3
+    probe_hidden_dim: int = 0
 
 
 @dataclass
@@ -201,7 +211,7 @@ class ExperimentConfig:
 
 def get_config(name: str = "stage1_full") -> ExperimentConfig:
     config = ExperimentConfig(name=name)
-
+    
     if name == "stage1_full":
         config.stage = 1
     
@@ -243,7 +253,64 @@ def get_config(name: str = "stage1_full") -> ExperimentConfig:
     elif name == "stage1_ablation_mmd_consistency":
         config.stage = 1
         config.name = "stage1_ablation_mmd_consistency"
-        config.stage1_training.consistency_method = "mmd"
+        config.stage1_training.use_mmd = True
+        config.stage1_training.mmd_weight = 2.5
+        config.stage1_training.use_cross_subject_consistency = False
+        config.stage1_training.consistency_weight = 0.0
+    
+    elif name == "stage1_temporal_only":
+        config.stage = 1
+        config.name = "stage1_temporal_only"
+        config.stage1_training.use_temporal_contrastive = True
+        config.stage1_training.temporal_weight = 1.0
+        config.stage1_training.use_cross_subject_consistency = False
+        config.stage1_training.consistency_weight = 0.0
+        config.stage1_training.use_cross_subject_infonce = False
+        config.stage1_training.infonce_weight = 0.0
+    
+    elif name == "stage1_infonce":
+        config.stage = 1
+        config.name = "stage1_infonce"
+        config.stage1_training.use_temporal_contrastive = True
+        config.stage1_training.temporal_weight = 1.0
+        config.stage1_training.use_cross_subject_consistency = False
+        config.stage1_training.consistency_weight = 0.0
+        config.stage1_training.use_cross_subject_infonce = True
+        config.stage1_training.infonce_weight = 1.0
+    
+    elif name == "stage1_infonce_curriculum":
+        config.stage = 1
+        config.name = "stage1_infonce_curriculum"
+        config.stage1_training.use_temporal_contrastive = True
+        config.stage1_training.temporal_weight = 1.0
+        config.stage1_training.use_cross_subject_consistency = False
+        config.stage1_training.consistency_weight = 0.0
+        config.stage1_training.use_cross_subject_infonce = True
+        config.stage1_training.infonce_weight = 1.0
+        config.stage1_training.use_curriculum = True
+        config.stage1_training.curriculum_phase1_epochs = 30
+    
+    elif name == "stage1_cosine_curriculum":
+        config.stage = 1
+        config.name = "stage1_cosine_curriculum"
+        config.stage1_training.use_temporal_contrastive = True
+        config.stage1_training.temporal_weight = 1.0
+        config.stage1_training.use_cross_subject_consistency = True
+        config.stage1_training.consistency_weight = 2.5
+        config.stage1_training.use_curriculum = True
+        config.stage1_training.curriculum_phase1_epochs = 30
+    
+    elif name == "stage1_infonce_mmd":
+        config.stage = 1
+        config.name = "stage1_infonce_mmd"
+        config.stage1_training.use_temporal_contrastive = True
+        config.stage1_training.temporal_weight = 1.0
+        config.stage1_training.use_cross_subject_consistency = False
+        config.stage1_training.consistency_weight = 0.0
+        config.stage1_training.use_cross_subject_infonce = True
+        config.stage1_training.infonce_weight = 1.0
+        config.stage1_training.use_mmd = True
+        config.stage1_training.mmd_weight = 0.5
     
     elif name == "stage2_full":
         config.stage = 2
@@ -285,4 +352,113 @@ def get_config(name: str = "stage1_full") -> ExperimentConfig:
     elif name == "stage3_ablation_lora_only":
         config.stage = 3
         config.name = "stage3_ablation_lora_only"
-        config.adap
+        config.adapter.stage3_use_prefix = False
+    
+    elif name == "stage3_ablation_prefix_only":
+        config.stage = 3
+        config.name = "stage3_ablation_prefix_only"
+        config.adapter.stage3_use_lora = False
+    
+    elif name == "stage3_ablation_no_adaptation":
+        config.stage = 3
+        config.name = "stage3_ablation_no_adaptation"
+        config.adapter.stage3_use_lora = False
+        config.adapter.stage3_use_prefix = False
+    
+    elif name == "stage3_ablation_large_lora":
+        config.stage = 3
+        config.name = "stage3_ablation_large_lora"
+        config.adapter.stage3_lora_rank = 128
+    
+    elif name == "stage3_ablation_few_shot_10":
+        config.stage = 3
+        config.name = "stage3_ablation_few_shot_10"
+        config.stage3_training.min_trials_per_subject = 10
+        config.stage3_training.max_trials_per_subject = 10
+    
+    elif name == "stage3_ablation_few_shot_50":
+        config.stage = 3
+        config.name = "stage3_ablation_few_shot_50"
+        config.stage3_training.min_trials_per_subject = 50
+        config.stage3_training.max_trials_per_subject = 50
+    
+    else:
+        raise ValueError(f"Unknown config name: {name}")
+    
+    return config
+
+
+def list_available_configs() -> List[str]:
+    configs = [
+        "stage1_full",
+        "stage1_ablation_no_consistency",
+        "stage1_ablation_no_temporal",
+        "stage1_ablation_consistency_only",
+        "stage1_ablation_low_consistency",
+        "stage1_ablation_high_consistency",
+        "stage1_ablation_with_masking",
+        "stage1_ablation_mmd_consistency",
+        "stage1_temporal_only",
+        "stage1_infonce",
+        "stage1_infonce_curriculum",
+        "stage1_cosine_curriculum",
+        "stage1_infonce_mmd",
+        "stage2_full",
+        "stage2_ablation_no_alignment",
+        "stage2_ablation_no_contrastive",
+        "stage2_ablation_alignment_only",
+        "stage2_ablation_no_qformer",
+        "stage2_ablation_high_alignment",
+        "stage3_full",
+        "stage3_ablation_lora_only",
+        "stage3_ablation_prefix_only",
+        "stage3_ablation_no_adaptation",
+        "stage3_ablation_large_lora",
+        "stage3_ablation_few_shot_10",
+        "stage3_ablation_few_shot_50",
+    ]
+    return configs
+
+
+def print_config_diff(config1: ExperimentConfig, config2: ExperimentConfig):
+    dict1 = config1.to_dict()
+    dict2 = config2.to_dict()
+    
+    def flatten_dict(d, parent_key=''):
+        items = []
+        for k, v in d.items():
+            new_key = f"{parent_key}.{k}" if parent_key else k
+            if isinstance(v, dict):
+                items.extend(flatten_dict(v, new_key).items())
+            else:
+                items.append((new_key, v))
+        return dict(items)
+    
+    flat1 = flatten_dict(dict1)
+    flat2 = flatten_dict(dict2)
+    
+    print(f"\nDifferences between {config1.name} and {config2.name}:")
+    print("=" * 80)
+    
+    all_keys = set(flat1.keys()) | set(flat2.keys())
+    for key in sorted(all_keys):
+        val1 = flat1.get(key, "N/A")
+        val2 = flat2.get(key, "N/A")
+        if val1 != val2:
+            print(f"{key}:")
+            print(f"  {config1.name}: {val1}")
+            print(f"  {config2.name}: {val2}")
+
+
+if __name__ == "__main__":
+    print("Available configurations:")
+    for name in list_available_configs():
+        print(f"  - {name}")
+    
+    config = get_config("stage1_full")
+    config.save("./configs/stage1_full.yaml")
+    print(f"\nSaved config to ./configs/stage1_full.yaml")
+    
+    config1 = get_config("stage1_full")
+    config2 = get_config("stage1_ablation_no_consistency")
+    print_config_diff(config1, config2)
