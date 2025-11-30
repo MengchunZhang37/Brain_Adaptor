@@ -237,7 +237,7 @@ class Stage1Trainer:
         self.global_step = 0
         self.best_val_loss = float('inf')
         self.best_probe_cosine = -float('inf')
-        self.best_epoch = 0
+        self.best_val_epoch = 0
         self.early_stopping_counter = 0
     
     def _setup_probe(self):
@@ -590,7 +590,7 @@ class Stage1Trainer:
             'val_consistency': avg_consistency
         }
     
-    def save_checkpoint(self, epoch: int, is_best_probe: bool = False):
+    def save_checkpoint(self, epoch: int, is_best_probe: bool = False, is_best_val: bool = False):
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.adapter.state_dict(),
@@ -598,21 +598,42 @@ class Stage1Trainer:
             'config': self.config.to_dict(),
             'global_step': self.global_step,
             'best_probe_cosine': self.best_probe_cosine,
+            'best_val_loss': self.best_val_loss,
         }
         
-        if is_best_probe:
-            best_path = self.output_dir / "best_model.pt"
-            torch.save(checkpoint, best_path)
-            print(f"  Saved best model (probe_cosine={self.best_probe_cosine:.4f}) to {best_path}")
+        path = self.output_dir / f"checkpoint_epoch{epoch}.pt"
+        torch.save(checkpoint, path)
         
-        if epoch % self.config.stage1_training.save_every_n_epochs == 0:
-            path = self.output_dir / f"checkpoint_epoch{epoch}.pt"
-            torch.save(checkpoint, path)
+        if is_best_probe:
+            best_probe_path = self.output_dir / "best_model_probe.pt"
+            torch.save(checkpoint, best_probe_path)
+            print(f"  Saved best_model_probe.pt (probe_cosine={self.best_probe_cosine:.4f})")
+        
+        if is_best_val:
+            self.best_val_epoch = epoch
+            best_val_path = self.output_dir / "best_model_val.pt"
+            torch.save(checkpoint, best_val_path)
+            print(f"  Saved best_model_val.pt (val_temporal={self.best_val_loss:.4f})")
+        
+        self._cleanup_checkpoints()
+    
+    def _cleanup_checkpoints(self):
+        if not hasattr(self, 'best_val_epoch') or self.best_val_epoch is None:
+            return
+        
+        keep_range = 10
+        checkpoints = list(self.output_dir.glob("checkpoint_epoch*.pt"))
+        
+        for ckpt in checkpoints:
+            try:
+                ckpt_epoch = int(ckpt.stem.replace("checkpoint_epoch", ""))
+            except ValueError:
+                continue
             
-            checkpoints = sorted(self.output_dir.glob("checkpoint_epoch*.pt"))
-            if len(checkpoints) > self.config.stage1_training.keep_last_n_checkpoints:
-                for ckpt in checkpoints[:-self.config.stage1_training.keep_last_n_checkpoints]:
-                    ckpt.unlink()
+            if abs(ckpt_epoch - self.best_val_epoch) <= keep_range:
+                continue
+            else:
+                ckpt.unlink()
     
     def train(self):
         print(f"\n{'='*70}")
@@ -666,16 +687,14 @@ class Stage1Trainer:
                     
                     if probe_metrics['cosine_similarity'] > self.best_probe_cosine:
                         self.best_probe_cosine = probe_metrics['cosine_similarity']
-                        self.best_epoch = epoch
                         is_best_probe = True
-                        print(f"  New best! (probe_cosine: {self.best_probe_cosine:.4f})")
+                        print(f"  New best probe! (cosine: {self.best_probe_cosine:.4f})")
             
-            if self.probe_data is None:
-                if val_metrics['val_temporal'] < self.best_val_loss:
-                    self.best_val_loss = val_metrics['val_temporal']
-                    self.best_epoch = epoch
-                    is_best_probe = True
-                    print(f"  New best! (val_temporal: {self.best_val_loss:.4f})")
+            is_best_val = False
+            if val_metrics['val_temporal'] < self.best_val_loss:
+                self.best_val_loss = val_metrics['val_temporal']
+                is_best_val = True
+                print(f"  New best val! (val_temporal: {self.best_val_loss:.4f})")
             
             if self.config.system.use_wandb:
                 log_dict = {
@@ -707,22 +726,22 @@ class Stage1Trainer:
                 wandb.log(log_dict, step=self.global_step)
                 
                 if is_best_probe:
-                    if self.probe_data is not None:
-                        wandb.run.summary['best_probe_cosine'] = self.best_probe_cosine
-                    else:
-                        wandb.run.summary['best_val_temporal'] = self.best_val_loss
-                    wandb.run.summary['best_epoch'] = self.best_epoch
+                    wandb.run.summary['best_probe_cosine'] = self.best_probe_cosine
+                if is_best_val:
+                    wandb.run.summary['best_val_temporal'] = self.best_val_loss
+                    wandb.run.summary['best_val_epoch'] = epoch
             
-            self.save_checkpoint(epoch, is_best_probe=is_best_probe)
+            self.save_checkpoint(epoch, is_best_probe=is_best_probe, is_best_val=is_best_val)
         
         print(f"\n{'='*70}")
         print(f"Training complete!")
         print(f"{'='*70}")
-        if self.probe_data is not None:
-            print(f"  Best probe_cosine: {self.best_probe_cosine:.4f} (epoch {self.best_epoch})")
-        else:
-            print(f"  Best val_temporal: {self.best_val_loss:.4f} (epoch {self.best_epoch})")
-        print(f"  Best model: {self.output_dir / 'best_model.pt'}")
+        print(f"  Best probe_cosine: {self.best_probe_cosine:.4f}")
+        print(f"  Best val_temporal: {self.best_val_loss:.4f} (epoch {getattr(self, 'best_val_epoch', 'N/A')})")
+        print(f"  Saved models:")
+        print(f"    - best_model_probe.pt (by probe_cosine)")
+        print(f"    - best_model_val.pt (by val_temporal)")
+        print(f"    - checkpoint_epoch*.pt (around best_val ±3)")
         print(f"  Outputs: {self.output_dir}")
         
         if self.config.system.use_wandb:
@@ -795,7 +814,7 @@ def main():
     if 'gpt_config' in model_args:
         if 'init_args' in model_args['gpt_config']:
             model_args['gpt_config']['init_args']['n_channels'] = 90
-            print(f"  Modified n_channels: 128 → 90 (balanced channel selection)")
+            print(f"  Modified n_channels: 128  90 (balanced channel selection)")
     
     encoder_class_path = model_args['encoder']['class_path']
     encoder_module, encoder_class_name = encoder_class_path.rsplit('.', 1)
