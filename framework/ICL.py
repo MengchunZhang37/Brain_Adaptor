@@ -18,9 +18,7 @@ from config import get_config, get_simplified_config, print_split_info
 
 from new_dataset import create_ICL_dataloader
 from simplified_adapter import create_simplified_adapter
-from train_simplified import SimplifiedDataset, load_mvpformer  # ← 这里用你训练脚本的文件名
-
-
+from train_simplified import SimplifiedDataset, load_mvpformer  
 
 @torch.no_grad()
 def evaluate_icl_with_adapter(
