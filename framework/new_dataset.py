@@ -11,6 +11,24 @@ from pathlib import Path
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+def icl_collate_fn(batch):
+    """
+    ICL 下虽然 batch_size=1，但我们仍然返回带 batch 维的结构：
+    - tensor → 在 dim=0 unsqueeze 一下，变成 (1, ...)
+    - 非 tensor（比如字符串）→ 收集成长度为 1 的 list
+    """
+    assert len(batch) == 1, "ICL dataloader 目前假设 batch_size=1"
+    sample = batch[0]
+    collated = {}
+
+    for k, v in sample.items():
+        if torch.is_tensor(v):
+            collated[k] = v.unsqueeze(0)  # (1, ...)
+        else:
+            # target_word 等保留为 list[...]
+            collated[k] = [v]
+    return collated
+
 class BrainToLlamaAdapter(nn.Module):
     def __init__(self, brain_dim: int, llama_hidden_dim: int):
         super().__init__()
@@ -335,7 +353,9 @@ def create_ICL_dataloader(
         shuffle=False,        # 评估阶段不需要 shuffle
         num_workers=config.data.num_workers,
         pin_memory=True,
+        collate_fn=icl_collate_fn,  # 使用自定义的 collate_fn
     )
+
     print(f"ICL dataset size: {len(icl_dataset)} samples")
     return dataloader
 

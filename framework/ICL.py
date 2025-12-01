@@ -67,6 +67,8 @@ def evaluate_icl_with_adapter(
     total = 0
     correct = 0
 
+    print(f"Starting ICL evaluation ({icl_mode}) with adapter ...")
+
     for i, batch in enumerate(tqdm(dataloader, desc=f"ICL eval ({icl_mode}) with adapter")):
         if max_eval_samples is not None and total >= max_eval_samples:
             break
@@ -142,13 +144,16 @@ def evaluate_icl_with_adapter(
 
         # ========= icl_mode = "mc" =========
         else:  # "mc"
+        
             if "candidate_words" not in batch:
                 raise KeyError(
+
                     "icl_mode='mc' 需要 batch 中包含 'candidate_words' 字段，"
                     "形如 List[List[str]]，每个样本一个候选列表。"
                 )
 
             candidate_words_list = batch["candidate_words"][0]  # List[str] 对应当前样本
+            # print(f"候选词列表: {candidate_words_list}")
             # 计算每个候选的第一个 token 的 logit
             candidate_token_ids = []
             for w in candidate_words_list:
@@ -172,6 +177,7 @@ def evaluate_icl_with_adapter(
             # debug 信息
             # print(f"[MC] Sample {i}: target = '{target_word}' | pred = '{pred_word}' | "
             #       f"choices = {candidate_words_list} | correct = {is_correct}")
+            # break
 
     acc = correct / max(total, 1)
     print(f"ICL ({icl_mode}, with adapter) accuracy: {acc:.4f}  ({correct}/{total})")
