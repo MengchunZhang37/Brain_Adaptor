@@ -600,7 +600,7 @@ class Stage1Trainer:
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Stage 1 Training (Time-based Split)")
     parser.add_argument('--config', type=str, default='stage1_full')
     parser.add_argument('--data_root', type=str, required=True)
     parser.add_argument('--mvpformer_checkpoint', type=str, required=True)
