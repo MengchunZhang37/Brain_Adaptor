@@ -378,14 +378,22 @@ class Stage1Trainer:
         
         total_loss = 0.0
         total_temporal = 0.0
+        total_consistency = 0.0
         total_infonce = 0.0
+        total_mmd = 0.0
         n_batches = 0
         
         for batch in tqdm(self.val_loader, desc="Validating"):
             feature = batch['feature'].to(self.device)
             time_indices = batch['time_idx']
+            cross_subject_group = batch['cross_subject_group'].to(self.device)
             
             canonical = self.adapter(feature)
+            
+            batch_size, n_subjects, feat_dim = cross_subject_group.shape
+            cross_subject_flat = cross_subject_group.view(-1, feat_dim)
+            canonical_cross = self.adapter(cross_subject_flat)
+            canonical_cross = canonical_cross.view(batch_size, n_subjects, -1)
             
             loss = 0.0
             
@@ -410,34 +418,54 @@ class Stage1Trainer:
                 loss += self.config.stage1_training.temporal_weight * temporal_loss
                 total_temporal += temporal_loss.item()
             
+            if self.config.stage1_training.use_cross_subject_consistency and \
+               self.config.stage1_training.consistency_weight > 0:
+                consistency_loss = self.consistency_loss_fn(canonical_cross)
+                loss += self.config.stage1_training.consistency_weight * consistency_loss
+                total_consistency += consistency_loss.item()
+            
             if self.config.stage1_training.use_cross_subject_infonce:
                 infonce_loss = self.infonce_loss_fn(canonical, time_indices.to(self.device))
                 loss += self.config.stage1_training.infonce_weight * infonce_loss
                 total_infonce += infonce_loss.item()
+            
+            if self.config.stage1_training.use_mmd and \
+               self.config.stage1_training.mmd_weight > 0:
+                mmd_loss = self.mmd_loss_fn(canonical_cross)
+                loss += self.config.stage1_training.mmd_weight * mmd_loss
+                total_mmd += mmd_loss.item()
             
             total_loss += loss.item() if isinstance(loss, torch.Tensor) else loss
             n_batches += 1
         
         avg_loss = total_loss / n_batches if n_batches > 0 else 0
         avg_temporal = total_temporal / n_batches if n_batches > 0 else 0
+        avg_consistency = total_consistency / n_batches if n_batches > 0 else 0
         avg_infonce = total_infonce / n_batches if n_batches > 0 else 0
+        avg_mmd = total_mmd / n_batches if n_batches > 0 else 0
         
         self.writer.add_scalar('val/loss', avg_loss, epoch)
         self.writer.add_scalar('val/temporal', avg_temporal, epoch)
+        self.writer.add_scalar('val/consistency', avg_consistency, epoch)
         self.writer.add_scalar('val/infonce', avg_infonce, epoch)
+        self.writer.add_scalar('val/mmd', avg_mmd, epoch)
         
         if self.config.system.use_wandb and WANDB_AVAILABLE:
             wandb.log({
                 'val/loss': avg_loss,
                 'val/temporal': avg_temporal,
+                'val/consistency': avg_consistency,
                 'val/infonce': avg_infonce,
+                'val/mmd': avg_mmd,
                 'epoch': epoch,
             }, step=self.global_step)
         
         return {
             'val_loss': avg_loss,
             'val_temporal': avg_temporal,
+            'val_consistency': avg_consistency,
             'val_infonce': avg_infonce,
+            'val_mmd': avg_mmd,
         }
     
     def run_downstream_probe(self, epoch: int):
@@ -572,7 +600,7 @@ class Stage1Trainer:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Stage 1 Training (Time-based Split)")
+    parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='stage1_full')
     parser.add_argument('--data_root', type=str, required=True)
     parser.add_argument('--mvpformer_checkpoint', type=str, required=True)
@@ -663,8 +691,8 @@ def main():
         split='val',
     )
     
-    print(f" Train samples: {len(train_loader.dataset)}")
-    print(f" Val samples: {len(val_loader.dataset)}")
+    print(f"Train samples: {len(train_loader.dataset)}")
+    print(f"Val samples: {len(val_loader.dataset)}")
     
     print("\nCreating adapter...")
     adapter = SubjectInvariantAdapter(
@@ -677,7 +705,7 @@ def main():
     )
     
     n_params = sum(p.numel() for p in adapter.parameters())
-    print(f" Adapter parameters: {n_params:,} ({n_params/1e6:.2f}M)")
+    print(f"Adapter parameters: {n_params:,} ({n_params/1e6:.2f}M)")
     
     trainer = Stage1Trainer(
         adapter=adapter,

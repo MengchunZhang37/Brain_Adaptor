@@ -372,30 +372,50 @@ class SimplifiedTrainer:
         }
     
     @torch.no_grad()
-    def validate(self):
+    def validate(self, epoch=None):
         self.adapter.eval()
         
         total_loss = 0
+        total_align = 0
+        total_temporal = 0
         total_cosine = 0
         n = 0
         
         for batch in self.val_loader:
             feature = batch['feature'].to(self.device)
             word_embedding = batch['word_embedding'].to(self.device)
+            next_feature = batch['next_feature'].to(self.device)
             
             pred = self.adapter(feature)
+            pred_next = self.adapter(next_feature)
+            
+            l_align = self.alignment_loss(pred, word_embedding)
+            l_temporal = self.temporal_loss(pred, pred_next)
+            loss = self.w_align * l_align + self.w_temporal * l_temporal
             
             cosine = nn.functional.cosine_similarity(pred, word_embedding, dim=1)
-            loss = (1.0 - cosine).mean()
             
             total_loss += loss.item()
+            total_align += l_align.item()
+            total_temporal += l_temporal.item()
             total_cosine += cosine.mean().item()
             n += 1
         
-        return {
+        metrics = {
             'val_loss': total_loss / n if n > 0 else 0,
+            'val_align': total_align / n if n > 0 else 0,
+            'val_temporal': total_temporal / n if n > 0 else 0,
             'val_cosine': total_cosine / n if n > 0 else 0,
         }
+        
+        if epoch is not None:
+            for k, v in metrics.items():
+                self.writer.add_scalar(f'val/{k}', v, epoch)
+        
+        if self.config.system.use_wandb and WANDB_AVAILABLE:
+            wandb.log({f'val/{k}': v for k, v in metrics.items()}, step=self.global_step)
+        
+        return metrics
     
     def save_checkpoint(self, epoch, is_best=False):
         ckpt = {
@@ -424,11 +444,11 @@ class SimplifiedTrainer:
         
         for epoch in range(1, self.config.training.num_epochs + 1):
             train_m = self.train_epoch(epoch)
-            val_m = self.validate()
+            val_m = self.validate(epoch)
             
             if verbose and (epoch % 10 == 0 or epoch == 1):
                 print(f"    Epoch {epoch}: loss={train_m['loss']:.4f}, "
-                      f"val_cosine={val_m['val_cosine']:.4f}")
+                      f"val_cosine={val_m['val_cosine']:.4f}, val_align={val_m['val_align']:.4f}")
             
             is_best = val_m['val_cosine'] > self.best_val_cosine
             if is_best:
@@ -693,7 +713,7 @@ def train_per_subject(config, mvpformer, subjects=None):
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Simplified Training")
     parser.add_argument('--config', type=str, default='simplified')
     parser.add_argument('--data_root', type=str, required=True)
     parser.add_argument('--mvpformer_checkpoint', type=str, required=True)
