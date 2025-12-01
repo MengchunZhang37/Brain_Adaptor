@@ -1,12 +1,13 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-import mne
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Literal
 import pandas as pd
 from tqdm import tqdm
 import pickle
+
+from config import DataConfig, TimeBasedSplitConfig, LinguisticConfig
 
 
 class PodcastECoGDataset(Dataset):
@@ -15,14 +16,19 @@ class PodcastECoGDataset(Dataset):
         data_root: str,
         subjects: List[int],
         mvpformer_model,
-        config,
+        config: DataConfig,
+        split: Literal['train', 'val', 'test'] = 'train',
         device: str = 'cuda',
     ):
         self.data_root = Path(data_root)
         self.subjects = subjects
         self.mvpformer = mvpformer_model
         self.config = config
+        self.split = split
         self.device = device
+        
+        self.split_config = config.split_config
+        self.time_start, self.time_end = self.split_config.get_split_bounds(split)
         
         self.sampling_rate = config.sampling_rate
         self.window_size = config.window_size
@@ -31,16 +37,19 @@ class PodcastECoGDataset(Dataset):
         self.cache_dir = Path(config.cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         
+        print(f"\n[{split.upper()}] Time range: {self.time_start/60:.1f} - {self.time_end/60:.1f} min")
+        print(f"[{split.upper()}] Using ALL {len(subjects)} subjects")
+        
         print("Loading preprocessed Podcast ECoG data...")
         self._load_data()
         
         print("Extracting MVPFormer features...")
         self._extract_features()
         
-        print("Creating temporal pairs and cross-subject groups...")
-        self._create_pairs_and_groups()
+        print("Creating time-based windows...")
+        self._create_time_based_samples()
         
-        print(f"Dataset ready: {len(self)} samples")
+        print(f" [{split.upper()}] Dataset ready: {len(self)} samples")
     
     def _load_data(self):
         self.raw_data = {}
@@ -52,11 +61,10 @@ class PodcastECoGDataset(Dataset):
             import json
             with open(channel_indices_file) as f:
                 selected_indices = json.load(f)
-            print(f"\nUsing balanced channel selection from: {channel_indices_file}")
+            print(f"  Using balanced channel selection")
             use_balanced = True
         else:
-            print(f"\nNo balanced channel indices found at {channel_indices_file}")
-            print(f"  Falling back to first 90 channels")
+            print(f"  No balanced channel indices, using first 90 channels")
             use_balanced = False
             target_channels = 90
         
@@ -64,7 +72,7 @@ class PodcastECoGDataset(Dataset):
             preprocessed_file = self.data_root / f"sub-{subj_id:02d}_hg_z.npy"
             
             if not preprocessed_file.exists():
-                print(f"Warning: {preprocessed_file} not found, skipping subject {subj_id}")
+                print(f"  {preprocessed_file} not found, skipping subject {subj_id}")
                 continue
             
             ecog_data = np.load(preprocessed_file)
@@ -73,73 +81,61 @@ class PodcastECoGDataset(Dataset):
             if use_balanced:
                 indices = selected_indices.get(str(subj_id), None)
                 if indices is None:
-                    print(f"  Subject {subj_id}: no indices in json, using first 90")
                     indices = list(range(min(90, orig_channels)))
-                
                 valid_indices = [i for i in indices if i < orig_channels]
-                if len(valid_indices) < len(indices):
-                    print(f"  Subject {subj_id}: {len(indices) - len(valid_indices)} indices out of bounds, using {len(valid_indices)} valid")
-                
                 if len(valid_indices) == 0:
-                    print(f"  Subject {subj_id}: no valid indices, SKIPPING!")
                     continue
-                
                 ecog_data = ecog_data[valid_indices, :]
-                print(f"  Subject {subj_id}: {orig_channels} → {len(valid_indices)} channels (balanced)")
             else:
                 if orig_channels < target_channels:
-                    print(f"  Subject {subj_id}: only {orig_channels} channels, SKIPPING!")
                     continue
                 ecog_data = ecog_data[:target_channels, :]
-                print(f"  Subject {subj_id}: {orig_channels} → {target_channels} channels")
             
-            windowed_data = self._create_windows(ecog_data)
-            
-            self.raw_data[subj_id] = windowed_data
+            self.raw_data[subj_id] = ecog_data
             self.channel_info[subj_id] = [f"ch{i}" for i in range(ecog_data.shape[0])]
         
         print(f"  Loaded {len(self.raw_data)} subjects")
-        if len(self.raw_data) > 0:
-            sample_shape = list(self.raw_data.values())[0].shape
-            print(f"  Window shape: {sample_shape}")
-    
-    def _create_windows(self, ecog_data: np.ndarray) -> np.ndarray:
-        n_channels, n_samples = ecog_data.shape
-        
-        window_samples = int(self.window_size * self.sampling_rate)
-        stride_samples = int(self.stride * self.sampling_rate)
-        
-        windows = []
-        for start in range(0, n_samples - window_samples + 1, stride_samples):
-            end = start + window_samples
-            window = ecog_data[:, start:end]
-            windows.append(window)
-        
-        return np.array(windows)
     
     def _extract_features(self):
         self.mvpformer.eval()
         self.mvpformer = self.mvpformer.to(self.device)
         
         self.features = {}
+        self.window_times = None
         
         for subj_id in tqdm(self.subjects, desc="Extracting features"):
             if subj_id not in self.raw_data:
                 continue
             
-            cache_file = self.cache_dir / f"sub{subj_id:02d}_features.pkl"
+            cache_file = self.cache_dir / f"sub{subj_id:02d}_features_all.pkl"
             
             if self.use_cache and cache_file.exists() and not self.config.force_recompute:
                 with open(cache_file, 'rb') as f:
-                    self.features[subj_id] = pickle.load(f)
+                    cached = pickle.load(f)
+                    self.features[subj_id] = cached['features']
+                    if self.window_times is None:
+                        self.window_times = cached['window_times']
             else:
-                windows = self.raw_data[subj_id]
+                ecog_data = self.raw_data[subj_id]
+                n_channels, n_samples = ecog_data.shape
+                
+                window_samples = int(self.window_size * self.sampling_rate)
+                stride_samples = int(self.stride * self.sampling_rate)
+                
                 features_list = []
+                window_times_list = []
                 
                 with torch.no_grad():
-                    for i, window in enumerate(windows):
-                        window_tensor = torch.from_numpy(window).float()
+                    start = 0
+                    
+                    while start + window_samples <= n_samples:
+                        window = ecog_data[:, start:start + window_samples]
                         
+                        center_sample = start + window_samples // 2
+                        center_time = center_sample / self.sampling_rate
+                        window_times_list.append(center_time)
+                        
+                        window_tensor = torch.from_numpy(window).float()
                         chunk_size = self.config.chunk_size
                         num_chunks = window_tensor.shape[1] // chunk_size
                         
@@ -148,17 +144,10 @@ class PodcastECoGDataset(Dataset):
                             start_idx = chunk_idx * chunk_size
                             end_idx = start_idx + chunk_size
                             chunk = window_tensor[:, start_idx:end_idx]
-                            
-                            chunk = chunk.unsqueeze(0).unsqueeze(0)
-                            chunk = chunk.to(self.device)
-                            
-                            if i == 0 and chunk_idx == 0:
-                                print(f"  Processing in {num_chunks} chunks of size {chunk_size}")
-                                print(f"  Chunk shape: {chunk.shape} [B, Seg, C, T]")
+                            chunk = chunk.unsqueeze(0).unsqueeze(0).to(self.device)
                             
                             try:
                                 result = self.mvpformer(chunk)
-                                
                                 if isinstance(result, tuple):
                                     feat = result[0]
                                     if hasattr(feat, 'last_hidden_state'):
@@ -174,88 +163,84 @@ class PodcastECoGDataset(Dataset):
                                     feat = feat.mean(dim=1)
                                 
                                 chunk_features.append(feat.cpu())
-                                
-                                if i == 0 and chunk_idx == 0:
-                                    print(f"  Chunk output: {feat.shape}")
-                                
                             except Exception as e:
-                                print(f"  Error processing chunk {chunk_idx}:")
-                                print(f"    Chunk shape: {chunk.shape}")
-                                print(f"    Error: {e}")
+                                print(f"  Error: {e}")
                                 raise
                         
                         window_feat = torch.stack(chunk_features).mean(dim=0)
-                        
-                        if i == 0:
-                            print(f"  Final window feature: {window_feat.shape}")
-                        
                         features_list.append(window_feat.numpy())
+                        
+                        start += stride_samples
                 
                 features = np.concatenate(features_list, axis=0)
+                window_times = np.array(window_times_list)
                 
                 if self.use_cache:
                     with open(cache_file, 'wb') as f:
-                        pickle.dump(features, f)
+                        pickle.dump({'features': features, 'window_times': window_times}, f)
                 
                 self.features[subj_id] = features
+                if self.window_times is None:
+                    self.window_times = window_times
         
-        print(f"  Feature shape: {list(self.features.values())[0].shape}")
+        print(f"  Feature shape per subject: {list(self.features.values())[0].shape}")
+        print(f"  Total windows (all time): {len(self.window_times)}")
     
-    def _create_pairs_and_groups(self):
-        min_windows = min(len(feat) for feat in self.features.values())
+    def _create_time_based_samples(self):
+        self.valid_window_indices = []
         
+        for idx, center_time in enumerate(self.window_times):
+            if self.time_start <= center_time < self.time_end:
+                if not self.split_config.is_in_buffer(center_time):
+                    self.valid_window_indices.append(idx)
+        
+        self.n_windows = len(self.valid_window_indices)
+        
+        min_total_windows = min(len(feat) for feat in self.features.values())
         for subj_id in self.features:
-            self.features[subj_id] = self.features[subj_id][:min_windows]
+            self.features[subj_id] = self.features[subj_id][:min_total_windows]
         
-        self.n_windows = min_windows
+        self.valid_window_indices = [idx for idx in self.valid_window_indices if idx < min_total_windows]
+        self.n_windows = len(self.valid_window_indices)
         
-        self.temporal_pairs = []
-        for subj_id in self.features:
-            for i in range(self.n_windows - 1):
-                self.temporal_pairs.append({
-                    'subject': subj_id,
-                    'anchor_idx': i,
-                    'positive_idx': i + 1,
-                })
-        
-        self.cross_subject_groups = []
-        for time_idx in range(self.n_windows):
-            group = {
-                'time_idx': time_idx,
-                'subjects': list(self.features.keys()),
-            }
-            self.cross_subject_groups.append(group)
+        print(f"  [{self.split.upper()}] Valid windows: {self.n_windows} "
+              f"(from {self.time_start/60:.1f}-{self.time_end/60:.1f} min)")
     
     def __len__(self) -> int:
-        return self.n_windows * len(self.subjects)
+        return self.n_windows * len(self.features)
     
     def __getitem__(self, idx: int) -> Dict:
-        subj_idx = idx % len(self.subjects)
-        time_idx = idx // len(self.subjects)
+        n_subjects = len(self.features)
+        window_in_split_idx = idx // n_subjects
+        subject_idx = idx % n_subjects
         
-        subj_id = self.subjects[subj_idx]
+        actual_window_idx = self.valid_window_indices[window_in_split_idx]
+        subj_id = list(self.features.keys())[subject_idx]
         
-        feature = torch.from_numpy(self.features[subj_id][time_idx]).float()
+        feature = torch.from_numpy(self.features[subj_id][actual_window_idx]).float()
         
-        if time_idx < self.n_windows - 1:
-            positive = torch.from_numpy(self.features[subj_id][time_idx + 1]).float()
+        if window_in_split_idx < self.n_windows - 1:
+            next_window_idx = self.valid_window_indices[window_in_split_idx + 1]
+            positive = torch.from_numpy(self.features[subj_id][next_window_idx]).float()
         else:
-            positive = torch.from_numpy(self.features[subj_id][time_idx - 1]).float()
+            prev_window_idx = self.valid_window_indices[window_in_split_idx - 1]
+            positive = torch.from_numpy(self.features[subj_id][prev_window_idx]).float()
         
         cross_subject_features = []
-        for other_subj in self.subjects:
-            if other_subj in self.features:
-                feat = torch.from_numpy(self.features[other_subj][time_idx]).float()
-                cross_subject_features.append(feat)
-        
+        for other_subj in self.features.keys():
+            feat = torch.from_numpy(self.features[other_subj][actual_window_idx]).float()
+            cross_subject_features.append(feat)
         cross_subject_features = torch.stack(cross_subject_features)
+        
+        center_time = self.window_times[actual_window_idx]
         
         return {
             'feature': feature,
             'temporal_positive': positive,
             'cross_subject_group': cross_subject_features,
             'subject_id': subj_id,
-            'time_idx': time_idx,
+            'time_idx': actual_window_idx,
+            'center_time': center_time,
         }
 
 
@@ -267,6 +252,7 @@ class PodcastLinguisticDataset(Dataset):
         stage1_adapter,
         mvpformer_model,
         config,
+        split: Literal['train', 'val', 'test'] = 'train',
         device: str = 'cuda',
     ):
         self.data_root = Path(data_root)
@@ -274,7 +260,13 @@ class PodcastLinguisticDataset(Dataset):
         self.stage1_adapter = stage1_adapter
         self.mvpformer = mvpformer_model
         self.config = config
+        self.split = split
         self.device = device
+        
+        self.split_config = config.data.split_config
+        self.time_start, self.time_end = self.split_config.get_split_bounds(split)
+        
+        print(f"\n[{split.upper()}] Time range: {self.time_start/60:.1f} - {self.time_end/60:.1f} min")
         
         print("Loading brain features from Stage 1...")
         self._load_brain_features()
@@ -282,10 +274,10 @@ class PodcastLinguisticDataset(Dataset):
         print("Loading linguistic features...")
         self._load_linguistic_features()
         
-        print("Aligning brain and linguistic features...")
-        self._align_features()
+        print("Aligning brain and linguistic features (time-based)...")
+        self._align_features_time_based()
         
-        print(f"Dataset ready: {len(self)} samples")
+        print(f" [{split.upper()}] Dataset ready: {len(self)} samples")
     
     def _load_brain_features(self):
         preprocessed_dir = self.data_root
@@ -297,6 +289,7 @@ class PodcastLinguisticDataset(Dataset):
             subjects=self.subjects,
             mvpformer_model=self.mvpformer,
             config=self.config.data,
+            split=self.split,
             device=self.device,
         )
         
@@ -304,6 +297,8 @@ class PodcastLinguisticDataset(Dataset):
         self.stage1_adapter = self.stage1_adapter.to(self.device)
         
         self.canonical_features = {}
+        self.window_times = ecog_dataset.window_times
+        self.valid_window_indices = ecog_dataset.valid_window_indices
         
         with torch.no_grad():
             for subj_id in self.subjects:
@@ -311,106 +306,67 @@ class PodcastLinguisticDataset(Dataset):
                     mvp_feat = torch.from_numpy(ecog_dataset.features[subj_id]).float().to(self.device)
                     canonical_feat = self.stage1_adapter(mvp_feat)
                     self.canonical_features[subj_id] = canonical_feat.cpu().numpy()
+        
+        print(f"  Canonical features: {list(self.canonical_features.values())[0].shape}")
     
     def _load_linguistic_features(self):
         data_root = self.data_root
-        
         if data_root.name == 'preprocessed':
             data_root = data_root.parent
         
         transcript_file = data_root / self.config.linguistic.transcript_file
         if not transcript_file.exists():
-            raise FileNotFoundError(
-                f"Transcript not found: {transcript_file}\n"
-                f"Expected: {self.config.linguistic.transcript_file}\n"
-                f"Update config.linguistic.transcript_file if needed"
-            )
+            raise FileNotFoundError(f"Transcript not found: {transcript_file}")
         
         self.words_df = pd.read_csv(transcript_file)
         print(f"  Loaded transcript: {len(self.words_df)} words")
-        print(f"  Columns: {self.words_df.columns.tolist()}")
         
         emb_file = data_root / self.config.linguistic.embeddings_file
         if not emb_file.exists():
-            raise FileNotFoundError(
-                f"Embeddings not found: {emb_file}\n"
-                f"Expected: {self.config.linguistic.embeddings_file}\n"
-                f"Update config.linguistic.embeddings_file if needed"
-            )
+            raise FileNotFoundError(f"Embeddings not found: {emb_file}")
         
         self.word_embeddings = np.load(emb_file)
         print(f"  Loaded embeddings: {self.word_embeddings.shape}")
-        
-        expected_dim = self.config.linguistic.embedding_dim
-        if self.word_embeddings.shape[1] != expected_dim:
-            print(f"  Warning: Expected dim {expected_dim}, got {self.word_embeddings.shape[1]}")
-            print(f"  Update config.linguistic.embedding_dim = {self.word_embeddings.shape[1]}")
-        
-        if len(self.words_df) != len(self.word_embeddings):
-            raise ValueError(
-                f"Mismatch: {len(self.words_df)} words in transcript "
-                f"but {len(self.word_embeddings)} embeddings"
-            )
-        
-        print(f"  Transcript and embeddings matched!")
     
-    def _align_features(self):
-        has_start_end = 'start' in self.words_df.columns and 'end' in self.words_df.columns
-        has_onset = 'onset' in self.words_df.columns or 'word_onset' in self.words_df.columns
-        
-        if has_start_end:
-            print("  Using time-based alignment (start/end columns found)")
-            self._align_by_start_end()
-        elif has_onset:
-            print("  Using time-based alignment (onset column found)")
-            self._align_by_time()
-        else:
-            print("  Using sequence-based alignment (no timing columns)")
-            self._align_by_sequence()
-        
-        print(f"  Created {len(self.aligned_pairs)} aligned pairs")
-    
-    def _align_by_start_end(self):
+    def _align_features_time_based(self):
         self.aligned_pairs = []
         
         window_size = self.config.data.window_size
         stride = self.config.data.stride
         
+        has_start_end = 'start' in self.words_df.columns and 'end' in self.words_df.columns
+        has_onset = 'onset' in self.words_df.columns or 'word_onset' in self.words_df.columns
+        onset_col = 'onset' if 'onset' in self.words_df.columns else 'word_onset' if 'word_onset' in self.words_df.columns else None
+        
         for idx, row in self.words_df.iterrows():
-            word_start = row['start']
-            word_end = row['end']
-            word_center = (word_start + word_end) / 2
-            word_idx = idx
+            if idx >= len(self.word_embeddings):
+                continue
+            
+            if has_start_end:
+                word_start = row['start']
+                word_end = row['end']
+                word_center = (word_start + word_end) / 2
+            elif onset_col:
+                word_center = row[onset_col]
+            else:
+                word_center = (idx / len(self.words_df)) * self.split_config.total_duration
+            
+            if not (self.time_start <= word_center < self.time_end):
+                continue
+            
+            if self.split_config.is_in_buffer(word_center):
+                continue
             
             window_idx = int((word_center - window_size / 2) / stride)
             window_idx = max(0, window_idx)
             
-            for subj_id in self.subjects:
-                if subj_id in self.canonical_features:
-                    n_windows = len(self.canonical_features[subj_id])
-                    if 0 <= window_idx < n_windows:
-                        self.aligned_pairs.append({
-                            'subject_id': subj_id,
-                            'brain_idx': window_idx,
-                            'word_idx': word_idx,
-                            'word': row['word'],
-                            'start': word_start,
-                            'end': word_end,
-                        })
-    
-    def _align_by_time(self):
-        onset_col = 'onset' if 'onset' in self.words_df.columns else 'word_onset'
-        
-        self.aligned_pairs = []
-        
-        sampling_rate = self.config.data.sampling_rate
-        stride = self.config.data.stride
-        
-        for idx, row in self.words_df.iterrows():
-            word_onset = row[onset_col]
-            word_idx = idx
-            
-            window_idx = int(word_onset / stride)
+            if window_idx not in self.valid_window_indices:
+                closest_valid = min(self.valid_window_indices, 
+                                   key=lambda x: abs(x - window_idx),
+                                   default=None)
+                if closest_valid is None:
+                    continue
+                window_idx = closest_valid
             
             for subj_id in self.subjects:
                 if subj_id in self.canonical_features:
@@ -419,31 +375,12 @@ class PodcastLinguisticDataset(Dataset):
                         self.aligned_pairs.append({
                             'subject_id': subj_id,
                             'brain_idx': window_idx,
-                            'word_idx': word_idx,
-                            'word': row['word'],
-                            'onset': word_onset,
+                            'word_idx': idx,
+                            'word': row.get('word', f'word_{idx}'),
+                            'word_time': word_center,
                         })
-    
-    def _align_by_sequence(self):
-        self.aligned_pairs = []
         
-        n_words = len(self.words_df)
-        
-        for subj_id in self.subjects:
-            if subj_id in self.canonical_features:
-                n_windows = len(self.canonical_features[subj_id])
-                
-                for word_idx in range(n_words):
-                    brain_idx = int((word_idx / n_words) * n_windows)
-                    brain_idx = min(brain_idx, n_windows - 1)
-                    
-                    self.aligned_pairs.append({
-                        'subject_id': subj_id,
-                        'brain_idx': brain_idx,
-                        'word_idx': word_idx,
-                        'word': self.words_df.iloc[word_idx]['word'],
-                        'onset': None,
-                    })
+        print(f"  [{self.split.upper()}] Aligned pairs: {len(self.aligned_pairs)}")
     
     def __len__(self) -> int:
         return len(self.aligned_pairs)
@@ -456,14 +393,17 @@ class PodcastLinguisticDataset(Dataset):
         word_idx = pair['word_idx']
         
         brain_feat = torch.from_numpy(self.canonical_features[subj_id][brain_idx]).float()
-        
         word_emb = torch.from_numpy(self.word_embeddings[word_idx]).float()
         
         n_windows = len(self.canonical_features[subj_id])
-        if brain_idx < n_windows - 1:
-            next_brain_feat = torch.from_numpy(self.canonical_features[subj_id][brain_idx + 1]).float()
+        
+        current_pos = self.valid_window_indices.index(brain_idx) if brain_idx in self.valid_window_indices else 0
+        if current_pos < len(self.valid_window_indices) - 1:
+            next_idx = self.valid_window_indices[current_pos + 1]
         else:
-            next_brain_feat = torch.from_numpy(self.canonical_features[subj_id][brain_idx - 1]).float()
+            next_idx = self.valid_window_indices[current_pos - 1] if current_pos > 0 else brain_idx
+        
+        next_brain_feat = torch.from_numpy(self.canonical_features[subj_id][next_idx]).float()
         
         return {
             'brain_feature': brain_feat,
@@ -475,62 +415,24 @@ class PodcastLinguisticDataset(Dataset):
         }
 
 
-class SubjectSpecificDataset(Dataset):
-    def __init__(
-        self,
-        subject_data: np.ndarray,
-        labels: np.ndarray,
-        config,
-    ):
-        self.data = subject_data
-        self.labels = labels
-        self.config = config
-        
-        max_trials = min(len(self.data), config.max_trials_per_subject)
-        self.data = self.data[:max_trials]
-        self.labels = self.labels[:max_trials]
-    
-    def __len__(self) -> int:
-        return len(self.data)
-    
-    def __getitem__(self, idx: int) -> Dict:
-        return {
-            'data': torch.from_numpy(self.data[idx]).float(),
-            'label': torch.tensor(self.labels[idx]).long(),
-        }
-
-
 def create_stage1_dataloader(
     data_root: str,
     subjects: List[int],
     mvpformer_model,
     config,
-    split: str = 'train',
+    split: Literal['train', 'val', 'test'] = 'train',
 ) -> DataLoader:
-    import random
-    
-    seed = config.data.split_seed
-    shuffled_subjects = subjects.copy()
-    random.Random(seed).shuffle(shuffled_subjects)
-    
-    n_subjects = len(shuffled_subjects)
-    n_train = int(n_subjects * config.data.train_split)
-    n_val = int(n_subjects * config.data.val_split)
-    
-    if split == 'train':
-        split_subjects = shuffled_subjects[:n_train]
-    elif split == 'val':
-        split_subjects = shuffled_subjects[n_train:n_train + n_val]
-    else:
-        split_subjects = shuffled_subjects[n_train + n_val:]
-    
-    print(f"  [seed={seed}] {split.upper()} subjects: {split_subjects}")
+    print(f"\n{'='*60}")
+    print(f"Creating Stage 1 DataLoader: {split.upper()}")
+    print(f"{'='*60}")
+    print(f"  Split method: TIME-BASED (all {len(subjects)} subjects in all splits)")
     
     dataset = PodcastECoGDataset(
         data_root=data_root,
-        subjects=split_subjects,
+        subjects=subjects,
         mvpformer_model=mvpformer_model,
         config=config.data,
+        split=split,
         device=config.system.device,
     )
     
@@ -541,6 +443,7 @@ def create_stage1_dataloader(
         num_workers=config.data.num_workers,
         pin_memory=config.data.pin_memory,
         prefetch_factor=config.data.prefetch_factor if config.data.num_workers > 0 else None,
+        drop_last=(split == 'train'),
     )
     
     return dataloader
@@ -552,72 +455,6 @@ def create_stage2_dataloader(
     stage1_adapter,
     mvpformer_model,
     config,
-    split: str = 'train',
+    split: Literal['train', 'val', 'test'] = 'train',
 ) -> DataLoader:
-    import random
-    
-    seed = config.data.split_seed
-    shuffled_subjects = subjects.copy()
-    random.Random(seed).shuffle(shuffled_subjects)
-    
-    n_subjects = len(shuffled_subjects)
-    n_train = int(n_subjects * config.data.train_split)
-    n_val = int(n_subjects * config.data.val_split)
-    
-    if split == 'train':
-        split_subjects = shuffled_subjects[:n_train]
-    elif split == 'val':
-        split_subjects = shuffled_subjects[n_train:n_train + n_val]
-    else:
-        split_subjects = shuffled_subjects[n_train + n_val:]
-    
-    print(f"  [seed={seed}] {split.upper()} subjects: {split_subjects}")
-    
-    dataset = PodcastLinguisticDataset(
-        data_root=data_root,
-        subjects=split_subjects,
-        stage1_adapter=stage1_adapter,
-        mvpformer_model=mvpformer_model,
-        config=config,
-        device=config.system.device,
-    )
-    
-    dataloader = DataLoader(
-        dataset,
-        batch_size=config.stage2_training.batch_size,
-        shuffle=(split == 'train'),
-        num_workers=config.data.num_workers,
-        pin_memory=config.data.pin_memory,
-    )
-    
-    return dataloader
-
-
-def create_stage3_dataloader(
-    subject_data: np.ndarray,
-    labels: np.ndarray,
-    config,
-    split: str = 'train',
-) -> DataLoader:
-    dataset = SubjectSpecificDataset(
-        subject_data=subject_data,
-        labels=labels,
-        config=config.stage3_training,
-    )
-    
-    train_size = int(len(dataset) * 0.8)
-    if split == 'train':
-        indices = range(train_size)
-    else:
-        indices = range(train_size, len(dataset))
-    
-    subset = torch.utils.data.Subset(dataset, list(indices))
-    
-    dataloader = DataLoader(
-        subset,
-        batch_size=config.stage3_training.batch_size,
-        shuffle=(split == 'train'),
-        num_workers=min(config.data.num_workers, 2),
-    )
-    
-    return dataloader
+    print
