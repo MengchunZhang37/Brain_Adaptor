@@ -1,0 +1,8 @@
+*.pt
+outputs/
+logs/
+checkpoints/
+cache/
+mvpformer/
+
+__pycache__/
