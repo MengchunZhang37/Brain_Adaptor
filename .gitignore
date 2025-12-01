@@ -6,3 +6,4 @@ cache/
 mvpformer/
 
 __pycache__/
+wandb/

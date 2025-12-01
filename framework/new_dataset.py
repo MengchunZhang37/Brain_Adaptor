@@ -103,11 +103,16 @@ class BrainLLMIclDataset(Dataset):
         tokenizer,
         n_demo: int = 4,
         max_length: int = 1024,
+        use_mc: bool = False,          # 是否构造多选题
+        mc_num_choices: int = 4,       # 多选题选项数（含正确答案）
     ):
         self.base = base_dataset          # SimplifiedDataset 实例
         self.tokenizer = tokenizer
         self.n_demo = n_demo
         self.max_length = max_length
+
+        self.use_mc = use_mc
+        self.mc_num_choices = mc_num_choices
         
         self.brain_token = "<brain>"      # 和 finetune 的保持一致
         
@@ -126,6 +131,33 @@ class BrainLLMIclDataset(Dataset):
         assert len(word_indices) > 0, f"Sample {sample_idx} has no word_indices."
         # 简单起见，用随机一个；也可以用 word_indices[0]
         return random.choice(word_indices)
+
+    def _sample_mc_candidates(self, target_word_idx: int):
+        """
+        构造多选题的候选词列表：
+        - 包含一个正确答案 (target_word)
+        - 另外 (mc_num_choices - 1) 个干扰项，从 words_df 中随机采样
+        
+        返回: List[str]，顺序已打乱
+        """
+        if (not self.use_mc) or self.mc_num_choices is None or self.mc_num_choices <= 1:
+            return None
+
+        n_neg = self.mc_num_choices - 1
+
+        all_indices = list(range(len(self.words_df)))
+        # 去掉正确答案的 index
+        all_indices = [i for i in all_indices if i != target_word_idx]
+
+        assert len(all_indices) >= n_neg, "词表太小，无法采样足够的干扰词。"
+
+        neg_indices = random.sample(all_indices, k=n_neg)
+        candidate_indices = [target_word_idx] + neg_indices
+
+        candidate_words = [self.words_df.iloc[i]["word"] for i in candidate_indices]
+        random.shuffle(candidate_words)  # 打乱，使正确答案位置不固定
+
+        return candidate_words
     
     def _build_demo_text(self, word_idx: int, idx_in_demo: int) -> str:
         """
@@ -140,15 +172,19 @@ class BrainLLMIclDataset(Dataset):
         return text
     
     def __getitem__(self, idx):
-        # 1. 取 query 样本（一个 (subject, window)）
-        base_item = self.base[idx]              # SimplifiedDataset.__getitem__
-        brain_feature = base_item["feature"]    # 脑特征
+        # ========= 1. query 部分 =========
+        # 1.1 取 query 样本（一个 (subject, window)）
+        base_item = self.base[idx]                    # SimplifiedDataset.__getitem__
+        query_brain_feature = base_item["feature"]    # (D_ecog)，query 的脑特征
         
-        # 从对应的 window-level 样本中选一个 word_idx
+        # 1.2 从对应的 window-level 样本中选一个 word_idx 作为 query 的目标词
         query_word_idx = self._pick_word_idx_from_sample(idx)
         query_word = self.words_df.iloc[query_word_idx]["word"]
+
+        # 如果要做 MC，这里基于 target_word_idx 构造 candidate_words
+        candidate_words = self._sample_mc_candidates(query_word_idx)
         
-        # 2. 构造 demo 样本 index（仍然在当前 Dataset 的 index 空间里采样）
+        # ========= 2. demo 部分（索引 + 脑特征 + 文本） =========
         all_indices = list(range(len(self.base)))
         if idx in all_indices:
             all_indices.remove(idx)
@@ -156,19 +192,41 @@ class BrainLLMIclDataset(Dataset):
         
         demo_indices = random.sample(all_indices, k=self.n_demo)
         
-        # 3. 文本部分
         header = (
             "You are a model that predicts the word a subject heard from their brain activity.\n\n"
             "Below are some examples.\n\n"
         )
         
         demo_texts = []
+        demo_brain_features = []     # (n_demo, D_ecog)
+        demo_word_indices = []       # 方便 debug / 分析
+        demo_words = []
+        
         for j, demo_idx in enumerate(demo_indices, start=1):
+            # 每个 demo 也取对应 window 的脑特征
+            demo_base_item = self.base[demo_idx]
+            demo_feat = demo_base_item["feature"]     # (D_ecog)
+            
+            # 为这个 demo 选一个 word_idx，构造文本
             demo_word_idx = self._pick_word_idx_from_sample(demo_idx)
+            word = self.words_df.iloc[demo_word_idx]["word"]
+            
             demo_texts.append(self._build_demo_text(demo_word_idx, j))
+            
+            demo_brain_features.append(demo_feat)
+            demo_word_indices.append(demo_word_idx)
+            demo_words.append(word)
+        
+        # 将 demo 的脑特征堆叠成 (n_demo, D_ecog)
+        if isinstance(demo_brain_features[0], torch.Tensor):
+            demo_brain_feature = torch.stack(demo_brain_features, dim=0)
+        else:
+            import numpy as np
+            demo_brain_feature = np.stack(demo_brain_features, axis=0)
         
         demos_block = "".join(demo_texts)
         
+        # ========= 3. query 文本部分 =========
         query_prompt = (
             "Now a new example:\n"
             f"{self.brain_token}\n"
@@ -203,7 +261,7 @@ class BrainLLMIclDataset(Dataset):
         labels = input_ids.clone()
         labels[:prompt_len] = -100
         
-        return {
+        item = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
@@ -211,15 +269,25 @@ class BrainLLMIclDataset(Dataset):
             "target_word": query_word,
             "target_word_idx": query_word_idx,
             
-            # 脑特征，用于外面映射到 LLM embedding
-            "brain_feature": brain_feature,
+            # ====== 脑特征部分 ======
+            "query_brain_feature": query_brain_feature,
+            "demo_brain_features": demo_brain_feature,
+            "brain_feature": query_brain_feature,
             
-            # 一些元信息
+            # ====== 一些元信息 ======
             "demo_indices": demo_indices,
+            "demo_word_indices": demo_word_indices,
+            "demo_words": demo_words,
             "query_index": idx,
             "subject_id": base_item["subject_id"],
             "window_idx": base_item["window_idx"],
         }
+
+        # 只有在 use_mc=True 时才加这个字段
+        if candidate_words is not None:
+            item["candidate_words"] = candidate_words
+
+        return item
 
 def create_ICL_dataloader(
     config,
@@ -229,9 +297,13 @@ def create_ICL_dataloader(
     subjects: Optional[List[int]] = None,
     n_demo: int = 4,
     max_length: int = 1024,
+    icl_mode: str = "generation",    # 新增：和 evaluate 一致
+    mc_num_choices: int = 4,         # 新增：MC 模式下的选项数
 ) -> DataLoader:
     """
     基于 SimplifiedDataset + BrainLLMIclDataset 构建 ICL 用的 DataLoader。
+    - icl_mode = "generation": 不需要 candidate_words
+    - icl_mode = "mc":        构造 candidate_words（正确 + 若干干扰）
     """
     subjects = subjects or config.data.subjects
 
@@ -245,11 +317,16 @@ def create_ICL_dataloader(
         device=config.system.device,
     )
 
+    # 是否开启多选题构造
+    use_mc = (icl_mode == "mc")
+
     icl_dataset = BrainLLMIclDataset(
         base_dataset=base_dataset,
         tokenizer=tokenizer,
         n_demo=n_demo,
         max_length=max_length,
+        use_mc=use_mc,                # 关键：根据 icl_mode 开关
+        mc_num_choices=mc_num_choices # 关键：多选题个数
     )
 
     dataloader = DataLoader(
