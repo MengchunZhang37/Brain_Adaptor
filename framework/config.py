@@ -20,7 +20,7 @@ class MVPFormerConfig:
 class AdapterConfig:
     mvpformer_dim: int = 2048
     canonical_dim: int = 1024
-    llama_hidden_dim: int = 4096
+    llama_hidden_dim: int = 1536
     hidden_dim: int = 2048
     
     stage1_num_layers: int = 2
@@ -196,12 +196,12 @@ class DataConfig:
 @dataclass
 class LinguisticConfig:
     transcript_file: str = "stimuli/podcast_transcript.csv"
-    embeddings_file: str = "semantic/llama2_7b_lastlayer_word_embeddings.npy"
+    embeddings_file: str = "semantic/qwen2_5_1_5B_lastlayer_word_embeddings.npy"
     
     use_word_embeddings: bool = True
     embedding_model: str = "llama2-7b"
     embedding_layer: int = -1
-    embedding_dim: int = 4096
+    embedding_dim: int = 1536
     context_length: int = 32
     
     use_phonetic_features: bool = False
@@ -386,7 +386,7 @@ class SimplifiedTrainingConfig:
 @dataclass
 class SimplifiedAdapterConfig:
     mvpformer_dim: int = 2048
-    llama_dim: int = 4096
+    llama_dim: int = 1536
     hidden_dim: int = 2048
     num_layers: int = 3
     dropout: float = 0.1

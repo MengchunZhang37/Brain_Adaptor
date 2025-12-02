@@ -285,71 +285,83 @@ class BrainLLMIclDataset(Dataset):
     
     def __getitem__(self, idx):
         # ========= 1. query 部分 =========
-        # 1.1 取 query 样本（一个 (subject, window)）
-        base_item = self.base[idx]                    # SimplifiedDataset.__getitem__
-        query_brain_feature = base_item["feature"]    # (D_ecog)，query 的脑特征
-        
-        # 1.2 从对应的 window-level 样本中选一个 word_idx 作为 query 的目标词
+        base_item = self.base[idx]
+        query_brain_feature = base_item["feature"]
         query_word_idx = self._pick_word_idx_from_sample(idx)
         query_word = self.words_df.iloc[query_word_idx]["word"]
 
-        # 如果要做 MC，这里基于 target_word_idx 构造 candidate_words
         candidate_words = self._sample_mc_candidates(query_word_idx)
-        
-        # ========= 2. demo 部分（索引 + 脑特征 + 文本） =========
-        all_indices = list(range(len(self.base)))
-        if idx in all_indices:
-            all_indices.remove(idx)
-        assert len(all_indices) >= self.n_demo, "base dataset 太小，无法抽取足够的 demo。"
-        
-        demo_indices = random.sample(all_indices, k=self.n_demo)
-        
-        header = (
-            "You are a model that predicts the word a subject heard from their brain activity.\n\n"
-            "Below are some examples.\n\n"
-        )
-        
+
+        # ========= 2. demo 部分 =========
         demo_texts = []
-        demo_brain_features = []     # (n_demo, D_ecog)
-        demo_word_indices = []       # 方便 debug / 分析
+        demo_brain_features = []
+        demo_word_indices = []
         demo_words = []
-        
-        for j, demo_idx in enumerate(demo_indices, start=1):
-            # 每个 demo 也取对应 window 的脑特征
-            demo_base_item = self.base[demo_idx]
-            demo_feat = demo_base_item["feature"]     # (D_ecog)
-            
-            # 为这个 demo 选一个 word_idx，构造文本
-            demo_word_idx = self._pick_word_idx_from_sample(demo_idx)
-            word = self.words_df.iloc[demo_word_idx]["word"]
-            
-            demo_texts.append(self._build_demo_text(demo_word_idx, j))
-            
-            demo_brain_features.append(demo_feat)
-            demo_word_indices.append(demo_word_idx)
-            demo_words.append(word)
-        
-        # 将 demo 的脑特征堆叠成 (n_demo, D_ecog)
-        if isinstance(demo_brain_features[0], torch.Tensor):
-            demo_brain_feature = torch.stack(demo_brain_features, dim=0)
+
+        # 根据 n_demo 是否为 0，决定 header 和 demo 部分
+        if self.n_demo > 0:
+            all_indices = list(range(len(self.base)))
+            if idx in all_indices:
+                all_indices.remove(idx)
+            assert len(all_indices) >= self.n_demo, "base dataset 太小，无法抽取足够的 demo。"
+
+            demo_indices = random.sample(all_indices, k=self.n_demo)
+
+            header = (
+                "You are a model that predicts the word a subject heard from their brain activity.\n\n"
+                "Below are some examples.\n\n"
+            )
+
+            for j, demo_idx in enumerate(demo_indices, start=1):
+                demo_base_item = self.base[demo_idx]
+                demo_feat = demo_base_item["feature"]
+                demo_word_idx = self._pick_word_idx_from_sample(demo_idx)
+                word = self.words_df.iloc[demo_word_idx]["word"]
+
+                demo_texts.append(self._build_demo_text(demo_word_idx, j))
+                demo_brain_features.append(demo_feat)
+                demo_word_indices.append(demo_word_idx)
+                demo_words.append(word)
+
+            # 将 demo 的脑特征堆叠成 (n_demo, D_ecog)
+            if isinstance(demo_brain_features[0], torch.Tensor):
+                demo_brain_feature = torch.stack(demo_brain_features, dim=0)
+            else:
+                import numpy as np
+                demo_brain_feature = np.stack(demo_brain_features, axis=0)
         else:
-            import numpy as np
-            demo_brain_feature = np.stack(demo_brain_features, axis=0)
-        
+        # 确保这些变量在 zero-shot 里也有定义
+            demo_indices = []
+            demo_word_indices = []
+            demo_words = []
+
+            # 这里同样给 header 赋值（没有 “Below are some examples”）
+            header = (
+                "You are a model that predicts the word a subject heard from their brain activity.\n\n"
+            )
+
+            # 关键：返回一个 (0, D) 的空 tensor，方便 DataLoader stack
+            if isinstance(query_brain_feature, torch.Tensor):
+                D = query_brain_feature.shape[-1]
+                demo_brain_feature = query_brain_feature.new_zeros((0, D))  # (0, D)
+            else:
+                import numpy as np
+                D = query_brain_feature.shape[-1]
+                demo_brain_feature = np.zeros((0, D), dtype=query_brain_feature.dtype)  # (0, D)
+
+
         demos_block = "".join(demo_texts)
-        
+
         # ========= 3. query 文本部分 =========
         query_prompt = (
             "Now a new example:\n"
             f"{self.brain_token}\n"
             "Word:"
         )
-        
-        # target：只训练/评估 query 的 word
+
         target = f" {query_word}" + self.tokenizer.eos_token
-        
         full_text = header + demos_block + query_prompt + target
-        
+
         enc = self.tokenizer(
             full_text,
             return_tensors="pt",
@@ -358,8 +370,7 @@ class BrainLLMIclDataset(Dataset):
         )
         input_ids = enc.input_ids[0]
         attention_mask = enc.attention_mask[0]
-        
-        # prompt_text：不包含 target 的部分，用来算 prompt_len
+
         prompt_text = header + demos_block + query_prompt
         prompt_enc = self.tokenizer(
             prompt_text,
@@ -368,11 +379,10 @@ class BrainLLMIclDataset(Dataset):
             truncation=True,
         )
         prompt_len = prompt_enc.input_ids.shape[1]
-        
-        # 只在 target 区段计 loss
+
         labels = input_ids.clone()
         labels[:prompt_len] = -100
-        
+
         item = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -380,13 +390,13 @@ class BrainLLMIclDataset(Dataset):
             "prompt_len": prompt_len,
             "target_word": query_word,
             "target_word_idx": query_word_idx,
-            
-            # ====== 脑特征部分 ======
+
+            # 脑特征
             "query_brain_feature": query_brain_feature,
             "demo_brain_features": demo_brain_feature,
             "brain_feature": query_brain_feature,
-            
-            # ====== 一些元信息 ======
+
+            # 元信息
             "demo_indices": demo_indices,
             "demo_word_indices": demo_word_indices,
             "demo_words": demo_words,
@@ -395,7 +405,6 @@ class BrainLLMIclDataset(Dataset):
             "window_idx": base_item["window_idx"],
         }
 
-        # 只有在 use_mc=True 时才加这个字段
         if candidate_words is not None:
             item["candidate_words"] = candidate_words
 
