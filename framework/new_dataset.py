@@ -29,6 +29,29 @@ def icl_collate_fn(batch):
             collated[k] = [v]
     return collated
 
+def mc_collate_fn(batch):
+    """
+    batch: List[dict]，每个元素是 BrainLLMMCDataset.__getitem__ 的返回。
+    """
+    brain_feature = torch.stack([item["brain_feature"] for item in batch], dim=0)  # (B, D)
+    subject_ids = torch.tensor([item["subject_id"] for item in batch], dtype=torch.long)
+    window_idx = torch.tensor([item["window_idx"] for item in batch], dtype=torch.long)
+    
+    target_words = [item["target_word"] for item in batch]            # List[str]
+    candidate_words = [item["candidate_words"] for item in batch]     # List[List[str]]
+    correct_choice_idx = torch.tensor(
+        [item["correct_choice_idx"] for item in batch], dtype=torch.long
+    )  # (B,)
+
+    return {
+        "brain_feature": brain_feature,          # (B, D)
+        "subject_id": subject_ids,               # (B,)
+        "window_idx": window_idx,                # (B,)
+        "target_word": target_words,             # List[str]
+        "candidate_words": candidate_words,      # List[List[str]]，每个内部长度 K
+        "correct_choice_idx": correct_choice_idx # (B,)
+    }
+
 class BrainLLMFinetuneDataset(Dataset):
     """
     用于 LLM 微调的 Dataset：
@@ -108,6 +131,82 @@ class BrainLLMFinetuneDataset(Dataset):
             "window_idx": base_item["window_idx"],
         }
 
+class BrainLLMMCDataset(Dataset):
+    """
+    用于 MC 微调的 Dataset：
+    - 基于 SimplifiedDataset（一条样本 = 一个 (subject, window_idx)）。
+    - 不直接构造 token；只返回 brain_feature + candidate_words + correct_choice_idx。
+    - 约定：正确答案在 candidate_words[correct_choice_idx]。
+    """
+    def __init__(
+        self,
+        base_dataset,         # SimplifiedDataset 实例
+        tokenizer,
+        mc_num_choices: int = 4,
+    ):
+        self.base = base_dataset
+        self.tokenizer = tokenizer
+        self.mc_num_choices = mc_num_choices
+
+        self.brain_token = "<brain>"
+        self.words_df = self.base.words_df
+        self.num_words = len(self.words_df)
+
+        assert self.mc_num_choices <= self.num_words, \
+            f"mc_num_choices={self.mc_num_choices} > num_words={self.num_words}"
+
+        # 用所有 word 的索引做负样本池
+        self.all_word_indices = list(range(self.num_words))
+
+    def __len__(self):
+        return len(self.base)
+
+    def _pick_word_idx_from_sample(self, sample_idx: int) -> int:
+        word_indices = self.base.samples[sample_idx]["word_indices"]
+        assert len(word_indices) > 0, f"Sample {sample_idx} has no word_indices."
+        return random.choice(word_indices)
+
+    def _sample_negatives(self, pos_idx: int):
+        # 从全局词表中采负样本
+        candidates = [i for i in self.all_word_indices if i != pos_idx]
+        n_neg = self.mc_num_choices - 1
+        assert len(candidates) >= n_neg, "词表太小，无法采样足够的负样本。"
+        neg_indices = random.sample(candidates, n_neg)
+        return neg_indices
+
+    def _build_candidates(self, pos_word_idx: int):
+        """
+        返回:
+            candidate_words: List[str]
+            correct_choice_idx: int  (0..mc_num_choices-1)
+        """
+        neg_word_indices = self._sample_negatives(pos_word_idx)
+        candidate_indices = [pos_word_idx] + neg_word_indices
+        random.shuffle(candidate_indices)
+
+        candidate_words = [self.words_df.iloc[i]["word"] for i in candidate_indices]
+        correct_choice_idx = candidate_indices.index(pos_word_idx)
+        return candidate_words, correct_choice_idx
+
+    def __getitem__(self, idx):
+        base_item = self.base[idx]
+        brain_feature = base_item["feature"]       # (D_ecog,)
+
+        # 正样本 word
+        pos_word_idx = self._pick_word_idx_from_sample(idx)
+        pos_word = self.words_df.iloc[pos_word_idx]["word"]
+
+        # 候选 + 正确选项 index
+        candidate_words, correct_choice_idx = self._build_candidates(pos_word_idx)
+
+        return {
+            "brain_feature": torch.as_tensor(brain_feature, dtype=torch.float32),
+            "candidate_words": candidate_words,         # List[str]
+            "correct_choice_idx": correct_choice_idx,   # int
+            "target_word": pos_word,
+            "subject_id": base_item["subject_id"],
+            "window_idx": base_item["window_idx"],
+        }
 
 class BrainLLMIclDataset(Dataset):
     def __init__(
@@ -417,6 +516,78 @@ def create_finetune_dataloaders(
 
     print(f"[Finetune] Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
     return train_loader, val_loader
+
+def create_finetune_dataloaders_mc(
+    config,
+    mvpformer,
+    tokenizer,
+    subjects,
+    max_length: int,
+    batch_size: int,
+    mc_num_choices: int,
+):
+    """
+    MC 任务的 dataloader：
+    - 用 SimplifiedDataset + MVPFormer 提取 feature（和 LM 一致）；
+    - 再包一层 BrainLLMMCDataset + mc_collate_fn。
+    这里假设你已经有 create_simplified_datasets 或类似 API；
+    如果你是通过 create_finetune_dataloaders 生成 SimplifiedDataset，
+    可以在那里面拆出 base_train/base_val 再复用。
+    """
+
+    # 这个函数示意：你应该根据现有代码获取 train_base / val_base
+    subjects = subjects or config.data.subjects
+
+    print("\n[Finetune] Creating SimplifiedDataset for TRAIN (split='train')...")
+    base_train = SimplifiedDataset(
+        data_root=config.data.data_root,
+        subjects=subjects,
+        mvpformer_model=mvpformer,
+        config=config,
+        split='train',
+        device=config.system.device,
+    )
+
+    print("\n[Finetune] Creating SimplifiedDataset for VAL (split='val')...")
+    base_val = SimplifiedDataset(
+        data_root=config.data.data_root,
+        subjects=subjects,
+        mvpformer_model=mvpformer,
+        config=config,
+        split='val',
+        device=config.system.device,
+    )
+
+
+    train_dataset = BrainLLMMCDataset(
+        base_dataset=base_train,
+        tokenizer=tokenizer,
+        mc_num_choices=mc_num_choices,
+    )
+    val_dataset = BrainLLMMCDataset(
+        base_dataset=base_val,
+        tokenizer=tokenizer,
+        mc_num_choices=mc_num_choices,
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=config.data.num_workers,
+        pin_memory=True,
+        collate_fn=mc_collate_fn,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=config.data.num_workers,
+        pin_memory=True,
+        collate_fn=mc_collate_fn,
+    )
+    return train_loader, val_loader
+
 
 if __name__ == "__main__":
     pass

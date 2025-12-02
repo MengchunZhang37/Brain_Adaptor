@@ -4,6 +4,7 @@ import torch
 import yaml
 import importlib
 import argparse
+import os
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from typing import List, Optional
@@ -213,6 +214,10 @@ def main():
     parser.add_argument('--mc_num_choices', type=int, default=4,
                         help="多选题模式下的选项个数（包含正确答案）")
 
+    parser.add_argument('--llm_ckpt', type=str, default=None,
+                    help="Path to finetuned LLM state_dict or HF folder. "
+                         "If None, use args.llm_name from HF Hub.")
+
     args = parser.parse_args()
 
     # ---- 1) config & 数据相关 ----
@@ -231,10 +236,30 @@ def main():
 
     # ---- 3) 准备 tokenizer & LLaMA ----
     print("\nLoading LLaMA & tokenizer ...")
-    tokenizer = AutoTokenizer.from_pretrained(args.llm_name)
-    # 确保有 <brain> 这个特殊 token
+    if args.llm_ckpt is not None:
+        # 情况 2A: llm_ckpt 是一个 HF 目录（save_pretrained 存的）
+        if os.path.isdir(args.llm_ckpt):
+            tokenizer = AutoTokenizer.from_pretrained(args.llm_ckpt)
+            model = AutoModelForCausalLM.from_pretrained(args.llm_ckpt)
+            print(f"Loaded finetuned LLM from HF-style folder: {args.llm_ckpt}")
+        else:
+            # 情况 2B: llm_ckpt 是一个纯 state_dict 文件 (.pt / .bin)
+            tokenizer = AutoTokenizer.from_pretrained(args.llm_name)
+            model = AutoModelForCausalLM.from_pretrained(args.llm_name)
+
+            ckpt = torch.load(args.llm_ckpt, map_location="cpu")
+            # 根据你当时保存的 key 来改这里
+            state_dict = ckpt.get("model_state_dict", ckpt)
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            print("Loaded finetuned LLM state_dict from:", args.llm_ckpt)
+            print("Missing keys:", len(missing), "Unexpected keys:", len(unexpected))
+    else:
+        # 默认：直接从 HF Hub / 本地路径加载 base 模型
+        tokenizer = AutoTokenizer.from_pretrained(args.llm_name)
+        model = AutoModelForCausalLM.from_pretrained(args.llm_name)
+
+    # 确保有 <brain>，但如果你在微调时已经加过，就可以跳过这行或加个判断
     tokenizer.add_special_tokens({'additional_special_tokens': ['<brain>']})
-    model = AutoModelForCausalLM.from_pretrained(args.llm_name)
     model.resize_token_embeddings(len(tokenizer))
 
     # ---- 4) 构建 ICL dataloader ----

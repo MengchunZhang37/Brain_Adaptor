@@ -2,7 +2,7 @@ python framework/train_simplified.py \
     --config simplified \
     --data_root /user_data/yingjueb/ecog_pretrain/preprocessed \
     --mvpformer_checkpoint mvpformer/ckpts/genie-m-base.pt \
-    --output_dir outputs/simplified \
+    --output_dir outputs/simplified_qwen \
     --alignment_weight 0.5 \
     --temporal_weight 0.5 \
     --num_epochs 50 \

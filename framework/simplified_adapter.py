@@ -13,7 +13,7 @@ class SimplifiedAdapter(nn.Module):
     def __init__(
         self,
         mvpformer_dim: int = 2048,
-        llama_dim: int = 4096,
+        llama_dim: int = 1536,
         hidden_dim: int = 2048,
         num_layers: int = 3,
         dropout: float = 0.1,
@@ -77,7 +77,7 @@ class SimplifiedAdapterWithBottleneck(nn.Module):
     def __init__(
         self,
         mvpformer_dim: int = 2048,
-        llama_dim: int = 4096,
+        llama_dim: int = 1536,
         bottleneck_dim: int = 512,
         hidden_dim: int = 2048,
         dropout: float = 0.1,

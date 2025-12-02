@@ -5,9 +5,10 @@ python framework/finetune_LLM.py \
   --adapter_checkpoint outputs/simplified/simplified/best_model.pt \
   --llm_name meta-llama/Llama-2-7B-chat-hf \
   --ft_method lora \
-  --llm_lr 1e-4 \
+  --llm_lr 1e-5 \
   --llm_epochs 3 \
   --llm_batch_size 1 \
   --llm_max_length 256 \
   --freeze_adapter \
-  --output_dir /user_data/yingjueb/ecog_pretrain/outputs_llm_ft
+  --output_dir /user_data/yingjueb/ecog_pretrain/outputs_llm_ft_r4_2 \
+  --llm_task mc
