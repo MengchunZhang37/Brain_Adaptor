@@ -29,90 +29,85 @@ def icl_collate_fn(batch):
             collated[k] = [v]
     return collated
 
-class BrainToLlamaAdapter(nn.Module):
-    def __init__(self, brain_dim: int, llama_hidden_dim: int):
-        super().__init__()
-        self.proj = nn.Linear(brain_dim, llama_hidden_dim)
-
-    def forward(self, brain_feature: torch.Tensor) -> torch.Tensor:
-        """
-        brain_feature: (B, D_brain) or (B, 1, D_brain)
-        return: (B, D_llama)
-        """
-        if brain_feature.dim() == 3:
-            # e.g. (B, 1, D) -> (B, D)
-            brain_feature = brain_feature.squeeze(1)
-        print("Brain feature shape:", brain_feature.shape)
-        return self.proj(brain_feature)
-
 class BrainLLMFinetuneDataset(Dataset):
-    def __init__(self, base_dataset, tokenizer, max_length: int = 512):
+    """
+    用于 LLM 微调的 Dataset：
+    - 基于 SimplifiedDataset（一条样本 = 一个 (subject, window_idx)）。
+    - 文本结构：不含 demos，只是一个简单的 instruction + <brain> + Word: target。
+    """
+    def __init__(
+        self,
+        base_dataset,         # SimplifiedDataset 实例
+        tokenizer,
+        max_length: int = 256,
+    ):
         self.base = base_dataset
         self.tokenizer = tokenizer
         self.max_length = max_length
-        
-        # 假设你在 tokenizer 中已经添加了一个特殊 token 用来表示脑特征
-        # tokenizer.add_special_tokens({'additional_special_tokens': ['<brain>']})
+
         self.brain_token = "<brain>"
-    
+        self.words_df = self.base.words_df
+
     def __len__(self):
         return len(self.base)
-    
+
+    def _pick_word_idx_from_sample(self, sample_idx: int) -> int:
+        """
+        从 base.samples[sample_idx]['word_indices'] 中挑一个 word_idx。
+        """
+        word_indices = self.base.samples[sample_idx]["word_indices"]
+        assert len(word_indices) > 0, f"Sample {sample_idx} has no word_indices."
+        return random.choice(word_indices)   # 或者 word_indices[0]
+
     def __getitem__(self, idx):
-        base_item = self.base[idx]
-        brain_feat = base_item["brain_feature"]              # (D,)
-        word_idx = base_item["word_idx"]
-        
-        # 拿到真实单词（或你想预测的文本单位）
-        word = self.base.words_df.iloc[word_idx]["word"]
-        # 你也可以改成短句、上下文片段等
-        
-        # 构造 prompt + target 文本
-        # 这里示例：只训练 “word” 这一段，前面的 prompt 不计入 loss
-        prompt = (
-            "You are a model that predicts the word a subject heard, "
-            "given their brain activity.\n"
-            f"{self.brain_token}\n"
-            "The word is:"
+        base_item = self.base[idx]                 # {'feature', 'word_embedding', ...}
+        brain_feature = base_item["feature"]       # (D_ecog,)
+
+        word_idx = self._pick_word_idx_from_sample(idx)
+        word = self.words_df.iloc[word_idx]["word"]
+
+        header = (
+            "You are a model that predicts the word a subject heard from their brain activity.\n\n"
         )
-        target = f" {word}"  # 前面加空格是为了 tokenizer 对英文单词更自然
-        
-        # 拼接成完整输入序列，后面 + eos
-        full_text = prompt + target + self.tokenizer.eos_token
-        
+        prompt = header + f"{self.brain_token}\nWord:"
+        target = f" {word}" + self.tokenizer.eos_token
+
+        full_text = prompt + target
+
         enc = self.tokenizer(
             full_text,
             return_tensors="pt",
             max_length=self.max_length,
             truncation=True,
+            padding="max_length",
         )
         input_ids = enc.input_ids[0]          # (L,)
         attention_mask = enc.attention_mask[0]
-        
-        # 构造 labels: prompt 部分为 -100，只在 target+eos 区段训练
-        # 简单做法：再单独 encode 一次 prompt，长度用来划分边界
+
+        # 重新计算 prompt 长度：不要 padding
         prompt_enc = self.tokenizer(
             prompt,
             return_tensors="pt",
-            max_length=self.max_length,
             truncation=True,
+            padding=False,
         )
         prompt_len = prompt_enc.input_ids.shape[1]
-        
+        prompt_len = min(prompt_len, self.max_length)
+
         labels = input_ids.clone()
-        # prompt 位置不参与 loss
-        labels[:prompt_len] = -100
-        
+        labels[:prompt_len] = -100                 # prompt 部分不计入 loss
+        labels[attention_mask == 0] = -100         # padding 位置也不计入 loss
+
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
-            # 额外输出给 adapter 用
-            "brain_feature": brain_feat,     # (D,)
+            "brain_feature": brain_feature,
+            "target_word": word,
             "subject_id": base_item["subject_id"],
-            "word_idx": word_idx,
-            "brain_idx": base_item["brain_idx"],
+            "window_idx": base_item["window_idx"],
         }
+
 
 class BrainLLMIclDataset(Dataset):
     def __init__(
@@ -358,6 +353,70 @@ def create_ICL_dataloader(
 
     print(f"ICL dataset size: {len(icl_dataset)} samples")
     return dataloader
+
+def create_finetune_dataloaders(
+    config,
+    mvpformer,
+    tokenizer,
+    subjects: Optional[List[int]] = None,
+    max_length: int = 256,
+    batch_size: int = 4,
+):
+    """
+    复用 SimplifiedDataset 做时间/被试切分，然后包一层 BrainLLMFinetuneDataset。
+    """
+    subjects = subjects or config.data.subjects
+
+    print("\n[Finetune] Creating SimplifiedDataset for TRAIN (split='train')...")
+    train_base = SimplifiedDataset(
+        data_root=config.data.data_root,
+        subjects=subjects,
+        mvpformer_model=mvpformer,
+        config=config,
+        split='train',
+        device=config.system.device,
+    )
+
+    print("\n[Finetune] Creating SimplifiedDataset for VAL (split='val')...")
+    val_base = SimplifiedDataset(
+        data_root=config.data.data_root,
+        subjects=subjects,
+        mvpformer_model=mvpformer,
+        config=config,
+        split='val',
+        device=config.system.device,
+    )
+
+    train_ds = BrainLLMFinetuneDataset(
+        base_dataset=train_base,
+        tokenizer=tokenizer,
+        max_length=max_length,
+    )
+    val_ds = BrainLLMFinetuneDataset(
+        base_dataset=val_base,
+        tokenizer=tokenizer,
+        max_length=max_length,
+    )
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=config.data.num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=config.data.num_workers,
+        pin_memory=True,
+    )
+
+    print(f"[Finetune] Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
+    return train_loader, val_loader
 
 if __name__ == "__main__":
     pass

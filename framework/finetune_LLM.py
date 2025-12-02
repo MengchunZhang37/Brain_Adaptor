@@ -1,293 +1,387 @@
-import os
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import LoraConfig, PrefixTuningConfig, get_peft_model
 import argparse
-from typing import Dict
-
+from pathlib import Path
 import torch
-from torch.utils.data import Dataset
-from datasets import load_dataset
+from torch.utils.data import DataLoader
+from config import get_simplified_config, print_split_info
+from train_simplified import load_mvpformer
+from simplified_adapter import create_simplified_adapter
+from new_dataset import create_finetune_dataloaders
 
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    Trainer,
-    TrainingArguments,
-    DataCollatorForLanguageModeling,
-)
+from tqdm import tqdm
 
-from peft import (
-    LoraConfig,
-    PrefixTuningConfig,
-    PromptTuningConfig,
-    PromptTuningInit,
-    TaskType,
-    get_peft_model,
-)
+def build_peft_llm(
+    llm_name: str,
+    tokenizer,
+    ft_method: str = "lora",
+    r: int = 8,
+    lora_alpha: int = 32,
+    lora_dropout: float = 0.05,
+    prefix_length: int = 30,
+):
+    print(f"\nLoading base LLaMA model from {llm_name} ...")
+    base_model = AutoModelForCausalLM.from_pretrained(llm_name, torch_dtype=torch.bfloat16)
+    base_model.resize_token_embeddings(len(tokenizer))
 
-
-# ==============================
-# 1. 命令行参数
-# ==============================
-def parse_args():
-    parser = argparse.ArgumentParser(description="LLaMA PEFT fine-tuning (LoRA / Prefix / Prompt)")
-
-    parser.add_argument(
-        "--model_name",
-        type=str,
-        default="meta-llama/Llama-3-8B-Instruct",
-        help="base LLaMA 模型名（HF Hub 或本地路径）",
-    )
-    parser.add_argument(
-        "--adapter_type",
-        type=str,
-        default="lora",
-        choices=["lora", "prefix", "prompt"],
-        help="选择微调方式：lora / prefix / prompt",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="./outputs/llama_peft_unified",
-        help="输出目录",
-    )
-    parser.add_argument(
-        "--max_length",
-        type=int,
-        default=512,
-        help="每条样本的最大 token 长度",
-    )
-    parser.add_argument(
-        "--num_train_epochs",
-        type=int,
-        default=3,
-        help="训练 epoch 数",
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=2,
-        help="per_device_train_batch_size",
-    )
-    parser.add_argument(
-        "--gradient_accumulation_steps",
-        type=int,
-        default=8,
-        help="梯度累积步数",
-    )
-    parser.add_argument(
-        "--learning_rate",
-        type=float,
-        default=2e-4,
-        help="学习率",
-    )
-    parser.add_argument(
-        "--use_4bit",
-        action="store_true",
-        help="是否使用 4bit 量化 (QLoRA 风格)。不加此 flag 就是普通半精度",
-    )
-
-    return parser.parse_args()
-
-
-# ==============================
-# 2. 简单文本 Dataset（示例）
-# ==============================
-class SimpleTextDataset(Dataset):
-    """
-    这里只是示例：
-    - hf_dataset 每一行有一个 'text' 字段
-    - 实际使用中，你可以把 ECoG/EEG + prompt 拼成 text 放进来
-    """
-
-    def __init__(self, hf_dataset, tokenizer, max_length: int = 512):
-        self.ds = hf_dataset
-        self.tok = tokenizer
-        self.max_length = max_length
-
-    def __len__(self):
-        return len(self.ds)
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        text = self.ds[idx]["text"]
-
-        enc = self.tok(
-            text,
-            max_length=self.max_length,
-            truncation=True,
-            padding="max_length",
-            return_tensors="pt",
-        )
-
-        input_ids = enc["input_ids"][0]
-        attention_mask = enc["attention_mask"][0]
-        labels = input_ids.clone()
-
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-        }
-
-
-# ==============================
-# 3. 构造 PEFT 配置（LoRA / Prefix / Prompt）
-# ==============================
-def build_peft_model(model, adapter_type: str, model_name: str):
-    """
-    根据 adapter_type 返回挂了 PEFT 的模型：
-    - lora   → LoraConfig
-    - prefix → PrefixTuningConfig
-    - prompt → PromptTuningConfig (soft prompt)
-    """
-    if adapter_type == "lora":
+    if ft_method == "lora":
+        print("Using LoRA finetuning.")
         peft_config = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            r=64,
-            lora_alpha=16,
-            lora_dropout=0.05,
-            target_modules=[
-                "q_proj", "k_proj", "v_proj", "o_proj",
-                "gate_proj", "up_proj", "down_proj"
-            ],
+            r=r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
             bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
         )
-
-    elif adapter_type == "prefix":
+    elif ft_method == "prefix":
+        print("Using Prefix Tuning.")
         peft_config = PrefixTuningConfig(
-            task_type=TaskType.CAUSAL_LM,
-            num_virtual_tokens=30,  # 可调 10~100
+            task_type="CAUSAL_LM",
+            num_virtual_tokens=prefix_length,
         )
-
-    elif adapter_type == "prompt":
-        peft_config = PromptTuningConfig(
-            task_type=TaskType.CAUSAL_LM,
-            num_virtual_tokens=30,
-            prompt_tuning_init=PromptTuningInit.TEXT,
-            prompt_tuning_init_text="You are a helpful neuroscience assistant.",
-            tokenizer_name_or_path=model_name,
-        )
-
     else:
-        raise ValueError(f"Unknown adapter_type: {adapter_type}")
+        raise ValueError(f"Unknown ft_method: {ft_method}")
 
-    model = get_peft_model(model, peft_config)
+    model = get_peft_model(base_model, peft_config)
     model.print_trainable_parameters()
     return model
 
+def inject_brain_embeddings(
+    model,
+    adapter,
+    input_ids: torch.Tensor,      # (B, T)
+    brain_features: torch.Tensor, # (B, D_ecog)
+    brain_token_id: int,
+    device: torch.device,
+):
+    """
+    将每个样本中的 <brain> token 的 embedding 替换为 adapter(feature)。
+    """
+    input_ids = input_ids.to(device)
+    brain_features = brain_features.to(device)
 
-# ==============================
-# 4. 主程序：加载模型 + 数据 + 训练
-# ==============================
+    input_embeds = model.get_input_embeddings()(input_ids)  # (B, T, hidden)
+    B, T, hidden = input_embeds.shape
+
+    if brain_features.ndim == 1:
+        brain_features = brain_features.unsqueeze(0)        # (1, D)
+
+    brain_embeds = adapter(brain_features)                  # (B, hidden)
+
+    for b in range(B):
+        positions = (input_ids[b] == brain_token_id).nonzero(as_tuple=False).squeeze(1)
+        if positions.numel() == 0:
+            continue
+        # 如果 prompt 中有多个 <brain>，全部用同一个 brain_embeds[b]
+        for pos in positions:
+            p = pos.item()
+            input_embeds[b, p, :] = brain_embeds[b]
+
+    return input_embeds
+
+
+
+def train_one_epoch(
+    model,
+    adapter,
+    dataloader: DataLoader,
+    tokenizer,
+    optimizer,
+    device: torch.device,
+    epoch: int,
+    freeze_adapter: bool = True,
+    log_interval: int = 50,
+):
+    model.train()
+    if freeze_adapter:
+        adapter.eval()
+        for p in adapter.parameters():
+            p.requires_grad = False
+    else:
+        adapter.train()
+
+    brain_token_id = tokenizer.convert_tokens_to_ids("<brain>")
+
+    total_loss = 0.0
+    n_steps = 0
+
+    pbar = tqdm(dataloader, desc=f"[Train] Epoch {epoch}", leave=False)
+    for step, batch in enumerate(pbar):
+        input_ids = batch["input_ids"].to(device)           # (B, T)
+        attention_mask = batch["attention_mask"].to(device) # (B, T)
+        labels = batch["labels"].to(device)                 # (B, T)
+        brain_feature = batch["brain_feature"].to(device)   # (B, D)
+
+        optimizer.zero_grad()
+
+        inputs_embeds = inject_brain_embeddings(
+            model=model,
+            adapter=adapter,
+            input_ids=input_ids,
+            brain_features=brain_feature,
+            brain_token_id=brain_token_id,
+            device=device,
+        )
+
+        outputs = model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            labels=labels,
+        )
+        loss = outputs.loss
+
+        valid_mask = (labels != -100)
+        n_valid = valid_mask.sum().item()
+        if n_valid == 0:
+            print(f"[BUG] n_valid == 0 at step {step}")
+            print("  input_ids[0]:", input_ids[0][:50])
+            print("  labels[0]:   ", labels[0][:50])
+            raise ValueError("All labels are -100 in this batch!")
+
+        # 2. 检查 loss 是否是正常数值
+        if not torch.isfinite(loss):
+            with torch.no_grad():
+                max_logit = outputs.logits.abs().max().item()
+            print(f"[BUG] Non-finite loss at step {step}: {loss}")
+            print(f"      max |logit| = {max_logit}")
+            print("  n_valid:", n_valid)
+            raise ValueError("Non-finite loss")
+
+        # if step == 0 or step % 50 == 0:
+        #     print(f"[DEBUG] step {step}, loss = {loss.item()}")
+
+        if not torch.isfinite(loss):
+            print(f"[WARN] Non-finite loss at step {step}: {loss}")
+            # 这里可以打印 logits 范围
+            with torch.no_grad():
+                max_logit = outputs.logits.abs().max().item()
+            print(f"[DEBUG] max |logit| = {max_logit}")
+            raise ValueError("Non-finite loss, aborting to debug.")
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        total_loss += loss.item()
+        n_steps += 1
+
+        if (step + 1) % log_interval == 0:
+            avg_loss = total_loss / n_steps
+            pbar.set_postfix({"loss": f"{avg_loss:.4f}"})
+
+    avg_loss = total_loss / max(n_steps, 1)
+    return avg_loss
+
+
+@torch.no_grad()
+def evaluate_finetune(
+    model,
+    adapter,
+    dataloader: DataLoader,
+    tokenizer,
+    device: torch.device,
+    freeze_adapter: bool = True,
+):
+    model.eval()
+    if freeze_adapter:
+        adapter.eval()
+        for p in adapter.parameters():
+            p.requires_grad = False
+
+    brain_token_id = tokenizer.convert_tokens_to_ids("<brain>")
+
+    total_loss = 0.0
+    n_batches = 0
+
+    total = 0
+    correct = 0
+
+    for batch in tqdm(dataloader, desc="[Val]", leave=False):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+        brain_feature = batch["brain_feature"].to(device)
+        target_words = batch["target_word"]  # List[str]
+
+        inputs_embeds = inject_brain_embeddings(
+            model=model,
+            adapter=adapter,
+            input_ids=input_ids,
+            brain_features=brain_feature,
+            brain_token_id=brain_token_id,
+            device=device,
+        )
+
+        outputs = model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            labels=labels,
+        )
+        loss = outputs.loss
+        total_loss += loss.item()
+        n_batches += 1
+
+        # 简单 top-1 word accuracy：看第一个 label token 的预测是否匹配 word 的首 token
+        logits = outputs.logits  # (B, T, V)
+        B = input_ids.size(0)
+
+        for b in range(B):
+            tgt_pos = (labels[b] != -100).nonzero(as_tuple=False)
+            if len(tgt_pos) == 0:
+                continue
+            first_pos = tgt_pos[0].item()
+            pred_id = logits[b, first_pos].argmax(dim=-1).item()
+            pred_tok = tokenizer.decode([pred_id]).strip()
+            gt_word = target_words[b]
+            if gt_word.strip().lower() == pred_tok.lower():
+                correct += 1
+            total += 1
+
+    avg_loss = total_loss / max(n_batches, 1)
+    acc = correct / max(total, 1)
+    return avg_loss, acc
+
+
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser(description="Brain-conditioned LLaMA finetune (LoRA / Prefix)")
+    parser.add_argument('--config', type=str, default='simplified')
+    parser.add_argument('--data_root', type=str, required=True)
+    parser.add_argument('--mvpformer_checkpoint', type=str, required=True)
+    parser.add_argument('--adapter_checkpoint', type=str, required=True)
+    parser.add_argument('--output_dir', type=str, default='./outputs_llm_ft')
 
-    model_name = args.model_name
-    output_dir = args.output_dir
-    os.makedirs(output_dir, exist_ok=True)
+    parser.add_argument('--subjects', type=int, nargs='+', default=None)
 
-    # -------- 4.1 tokenizer --------
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
+    parser.add_argument('--llm_name', type=str,
+                        default='meta-llama/Llama-3-8B-Instruct')
+    parser.add_argument('--ft_method', type=str,
+                        choices=['lora', 'prefix'], default='lora')
+
+    parser.add_argument('--llm_lr', type=float, default=1e-4)
+    parser.add_argument('--llm_epochs', type=int, default=3)
+    parser.add_argument('--llm_batch_size', type=int, default=4)
+    parser.add_argument('--llm_max_length', type=int, default=256)
+    parser.add_argument('--freeze_adapter', action='store_true', default=True)
+
+    args = parser.parse_args()
+
+    # ---- 1) config & 路径 ----
+    config = get_simplified_config(args.config)
+    config.data.data_root = args.data_root
+    config.data.output_root = args.output_dir
+    config.mvpformer.checkpoint_path = args.mvpformer_checkpoint
+
+    print(f"Config: {args.config}")
+    print_split_info(config.data)
+
+    device = torch.device(config.system.device)
+
+    # ---- 2) MVPFormer ----
+    mvpformer = load_mvpformer(config)
+
+    # ---- 3) tokenizer & LLaMA ----
+    print("\nLoading tokenizer & adding <brain> ...")
+    tokenizer = AutoTokenizer.from_pretrained(args.llm_name)
+    tokenizer.add_special_tokens({'additional_special_tokens': ['<brain>']})
+
+    model = build_peft_llm(
+        llm_name=args.llm_name,
+        tokenizer=tokenizer,
+        ft_method=args.ft_method,
+    ).to(device)
+
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
+        model.config.pad_token_id = tokenizer.eos_token_id
 
-    # 如果你这里要加 <brain> 等特殊 token，可以这样：
-    # num_added = tokenizer.add_special_tokens({"additional_special_tokens": ["<brain>"]})
-    # print("Added special tokens:", num_added)
+    tokenizer.padding_side = "right"   # 或 "left"，看你后面 collate 的习惯
 
-    # -------- 4.2 base LLaMA 模型 --------
-    load_kwargs = {"device_map": "auto"}
+    # ---- 4) Adapter（Stage1 学到的脑 → 语义映射）----
+    print("\nLoading brain adapter checkpoint ...")
+    adapter = create_simplified_adapter(config.adapter)
+    ckpt = torch.load(args.adapter_checkpoint, map_location='cpu')
+    adapter.load_state_dict(ckpt['model_state_dict'])
+    adapter.to(device)
 
-    if args.use_4bit:
-        # QLoRA：4bit 量化加载
-        from transformers import BitsAndBytesConfig
-
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-        )
-        load_kwargs["quantization_config"] = bnb_config
-        load_kwargs["torch_dtype"] = torch.bfloat16
-    else:
-        load_kwargs["torch_dtype"] = torch.float16
-
-    model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
-
-    # 如果上面加了新 token，需要调整 embedding 尺寸：
-    # model.resize_token_embeddings(len(tokenizer))
-
-    # 4bit 时如果你习惯用 prepare_model_for_kbit_training，可以在这里加：
-    # from peft import prepare_model_for_kbit_training
-    # if args.use_4bit:
-    #     model = prepare_model_for_kbit_training(model)
-
-    # -------- 4.3 挂上 PEFT adapter --------
-    model = build_peft_model(model, adapter_type=args.adapter_type, model_name=model_name)
-
-    # =============================
-    # 5. 准备训练数据（这里只是 demo）
-    # =============================
-    # 示例：用 alpaca 的一部分数据
-    raw_ds = load_dataset("tatsu-lab/alpaca", split="train[:1000]")
-
-    def format_example(example):
-        if example.get("input"):
-            text = (
-                f"Instruction: {example['instruction']}\n"
-                f"Input: {example['input']}\n"
-                f"Response: {example['output']}"
+    # 检查 adapter 输出维度是否匹配 LLaMA hidden_size
+    hidden_size_llama = model.get_input_embeddings().embedding_dim
+    # 用一个 dummy feature 检查：如果 adapter 没有 input_dim，就跳过这个检查
+    if hasattr(adapter, "input_dim"):
+        dummy_feat = torch.randn(1, adapter.input_dim)
+        with torch.no_grad():
+            out = adapter(dummy_feat)
+        if out.shape[-1] != hidden_size_llama:
+            raise ValueError(
+                f"Adapter 输出维度 {out.shape[-1]} 与 LLaMA hidden_size {hidden_size_llama} 不匹配，"
+                "请在简化 adapter 设计时让输出维度 = LLaMA hidden_size，"
+                "或者在这里额外加一个 Linear 映射层。"
             )
-        else:
-            text = (
-                f"Instruction: {example['instruction']}\n"
-                f"Response: {example['output']}"
-            )
-        return {"text": text}
 
-    raw_ds = raw_ds.map(format_example)
-    train_dataset = SimpleTextDataset(raw_ds, tokenizer, max_length=args.max_length)
-
-    data_collator = DataCollatorForLanguageModeling(
+    # ---- 5) Dataloaders ----
+    train_loader, val_loader = create_finetune_dataloaders(
+        config=config,
+        mvpformer=mvpformer,
         tokenizer=tokenizer,
-        mlm=False,
+        subjects=args.subjects,
+        max_length=args.llm_max_length,
+        batch_size=args.llm_batch_size,
     )
 
-    # =============================
-    # 6. 训练参数 & Trainer
-    # =============================
-    training_args = TrainingArguments(
-        output_dir=output_dir,
-        per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        num_train_epochs=args.num_train_epochs,
-        learning_rate=args.learning_rate,
-        fp16=not args.use_4bit,
-        bf16=args.use_4bit,
-        logging_steps=10,
-        save_steps=200,
-        save_total_limit=2,
-        evaluation_strategy="no",
-        report_to="none",
-    )
+    # ---- 6) Optimizer ----
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    if not args.freeze_adapter:
+        for p in adapter.parameters():
+            p.requires_grad = True
+        trainable_params += list(adapter.parameters())
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=None,
-        data_collator=data_collator,
-    )
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.llm_lr)
 
-    trainer.train()
+    # ---- 7) Training Loop ----
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    # =============================
-    # 7. 保存 adapter
-    # =============================
-    adapter_dir = os.path.join(output_dir, f"{args.adapter_type}_adapter")
-    model.save_pretrained(adapter_dir)
-    tokenizer.save_pretrained(output_dir)
-    print(f"Adapter saved to: {adapter_dir}")
+    best_val_loss = float('inf')
+    best_val_acc = 0.0
+
+    for epoch in range(1, args.llm_epochs + 1):
+        train_loss = train_one_epoch(
+            model=model,
+            adapter=adapter,
+            dataloader=train_loader,
+            tokenizer=tokenizer,
+            optimizer=optimizer,
+            device=device,
+            epoch=epoch,
+            freeze_adapter=args.freeze_adapter,
+        )
+
+        val_loss, val_acc = evaluate_finetune(
+            model=model,
+            adapter=adapter,
+            dataloader=val_loader,
+            tokenizer=tokenizer,
+            device=device,
+            freeze_adapter=args.freeze_adapter,
+        )
+
+        print(f"Epoch {epoch}: "
+              f"train_loss={train_loss:.4f}, val_loss={val_loss:.4f}, val_acc={val_acc:.4f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_val_acc = val_acc
+            save_path = output_dir / f"best_llm_{args.ft_method}.pt"
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "adapter_state_dict": adapter.state_dict(),
+                "val_loss": val_loss,
+                "val_acc": val_acc,
+            }, save_path)
+            print(f"  Saved best checkpoint to {save_path}")
+
+    print(f"\nDone. Best val_loss={best_val_loss:.4f}, best val_acc={best_val_acc:.4f}")
 
 
 if __name__ == "__main__":
