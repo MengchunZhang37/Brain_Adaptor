@@ -743,6 +743,13 @@ def main():
     config.data.output_root = args.output_dir
     config.mvpformer.checkpoint_path = args.mvpformer_checkpoint
 
+    wandb.init(
+        project=config.system.wandb_project,
+        name=config.name,
+        config=config.to_dict(),
+        tags=['simplified', 'per-subject' if args.per_subject else 'shared', 'time-based-split'],
+    )
+
     if args.alignment_weight is not None:
         config.training.alignment_weight = args.alignment_weight
     if args.temporal_weight is not None:

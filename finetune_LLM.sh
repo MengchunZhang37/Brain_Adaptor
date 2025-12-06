@@ -2,13 +2,13 @@ python framework/finetune_LLM.py \
   --config simplified \
   --data_root /user_data/yingjueb/ecog_pretrain/preprocessed \
   --mvpformer_checkpoint mvpformer/ckpts/genie-m-base.pt \
-  --adapter_checkpoint outputs/simplified/simplified/best_model.pt \
-  --llm_name meta-llama/Llama-2-7B-chat-hf \
+  --adapter_checkpoint outputs/simplified_gpt2/simplified/best_model.pt \
+  --llm_name openai-community/gpt2 \
   --ft_method lora \
   --llm_lr 1e-5 \
   --llm_epochs 3 \
   --llm_batch_size 1 \
   --llm_max_length 256 \
   --freeze_adapter \
-  --output_dir /user_data/yingjueb/ecog_pretrain/outputs_llm_ft_r4_2 \
+  --output_dir /user_data/yingjueb/ecog_pretrain/outputs_llm_gpt2 \
   --llm_task mc

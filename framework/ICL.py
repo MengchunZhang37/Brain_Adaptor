@@ -1,10 +1,14 @@
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import json
 import sys
 from pathlib import Path
 import torch
 import yaml
 import importlib
 import argparse
-import os
+
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from typing import List, Optional
@@ -14,9 +18,6 @@ from tqdm import tqdm
 
 
 from config import get_config, get_simplified_config, print_split_info
-# from hierarchical_adapter_mvp_llama import SubjectInvariantAdapter, BrainToLlamaAdapter
-# from brain_datasets import create_ICL_dataloader
-
 from new_dataset import create_ICL_dataloader
 from simplified_adapter import create_simplified_adapter
 from train_simplified import SimplifiedDataset, load_mvpformer  
@@ -67,6 +68,7 @@ def evaluate_icl_with_adapter(
 
     total = 0
     correct = 0
+    all_correct = []
 
     print(f"Starting ICL evaluation ({icl_mode}) with adapter ...")
 
@@ -139,6 +141,7 @@ def evaluate_icl_with_adapter(
             is_correct = (target_word.strip().lower() == pred_token.lower())
             total += 1
             correct += int(is_correct)
+            all_correct.append(int(is_correct))
 
             # 你可以保留轻量的 debug 信息
             # print(f"[GEN] Sample {i}: target_word = '{target_word}' | pred = '{pred_token}' | correct = {is_correct}")
@@ -174,15 +177,26 @@ def evaluate_icl_with_adapter(
             is_correct = (pred_word.strip().lower() == target_word.strip().lower())
             total += 1
             correct += int(is_correct)
+            all_correct.append(int(is_correct))
 
             # debug 信息
             # print(f"[MC] Sample {i}: target = '{target_word}' | pred = '{pred_word}' | "
             #       f"choices = {candidate_words_list} | correct = {is_correct}")
             # break
 
-    acc = correct / max(total, 1)
-    print(f"ICL ({icl_mode}, with adapter) accuracy: {acc:.4f}  ({correct}/{total})")
-    return acc
+    if len(all_correct) == 0:
+        acc = 0.0
+        std = 0.0
+        n_samples = 0
+    else:
+        n_samples = len(all_correct)
+        acc = sum(all_correct) / n_samples
+        mean = acc
+        var = sum((c - mean) ** 2 for c in all_correct) / n_samples   # Bernoulli 上的样本方差
+        std = var ** 0.5
+
+    print(f"ICL ({icl_mode}, with adapter) accuracy: {acc:.4f}  ({correct}/{total}), std={std:.4f}")
+    return acc, std, n_samples
 
 
 # =========================
@@ -194,7 +208,8 @@ def main():
     parser.add_argument('--config', type=str, default='simplified')
     parser.add_argument('--data_root', type=str, required=True)
     parser.add_argument('--mvpformer_checkpoint', type=str, required=True)
-    parser.add_argument('--adapter_checkpoint', type=str, required=True)
+    parser.add_argument('--adapter_checkpoint', type=str, required=True,
+                        help="Shared: path to .pt; Per-subject: root dir containing sub-XX/best_model.pt")
 
     parser.add_argument('--output_dir', type=str, default='./outputs')
     parser.add_argument('--subjects', type=int, nargs='+', default=None)
@@ -210,13 +225,15 @@ def main():
                         choices=['generation', 'mc'],
                         help="ICL 评估模式：'generation' 直接预测；'mc' 多选题式评分")
 
-    # 建议加一个选项数参数
     parser.add_argument('--mc_num_choices', type=int, default=4,
                         help="多选题模式下的选项个数（包含正确答案）")
 
     parser.add_argument('--llm_ckpt', type=str, default=None,
-                    help="Path to finetuned LLM state_dict or HF folder. "
-                         "If None, use args.llm_name from HF Hub.")
+                        help="Path to finetuned LLM state_dict or HF folder. "
+                             "If None, use args.llm_name from HF Hub.")
+
+    parser.add_argument('--per_subject', action='store_true',
+                        help="如果设置，则按 subject 分别加载 adapter 并做 ICL 评估。")
 
     args = parser.parse_args()
 
@@ -231,70 +248,229 @@ def main():
 
     device = config.system.device
 
+    # subject 列表
+    subjects = args.subjects or getattr(config.data, "subjects", None)
+    if not subjects:
+        raise ValueError("No subjects specified. Use --subjects or set config.data.subjects.")
+
     # ---- 2) 加载 MVPFormer ----
     mvpformer = load_mvpformer(config)
 
     # ---- 3) 准备 tokenizer & LLaMA ----
     print("\nLoading LLaMA & tokenizer ...")
     if args.llm_ckpt is not None:
-        # 情况 2A: llm_ckpt 是一个 HF 目录（save_pretrained 存的）
         if os.path.isdir(args.llm_ckpt):
             tokenizer = AutoTokenizer.from_pretrained(args.llm_ckpt)
             model = AutoModelForCausalLM.from_pretrained(args.llm_ckpt)
             print(f"Loaded finetuned LLM from HF-style folder: {args.llm_ckpt}")
         else:
-            # 情况 2B: llm_ckpt 是一个纯 state_dict 文件 (.pt / .bin)
             tokenizer = AutoTokenizer.from_pretrained(args.llm_name)
             model = AutoModelForCausalLM.from_pretrained(args.llm_name)
 
             ckpt = torch.load(args.llm_ckpt, map_location="cpu")
-            # 根据你当时保存的 key 来改这里
             state_dict = ckpt.get("model_state_dict", ckpt)
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
             print("Loaded finetuned LLM state_dict from:", args.llm_ckpt)
             print("Missing keys:", len(missing), "Unexpected keys:", len(unexpected))
     else:
-        # 默认：直接从 HF Hub / 本地路径加载 base 模型
         tokenizer = AutoTokenizer.from_pretrained(args.llm_name)
         model = AutoModelForCausalLM.from_pretrained(args.llm_name)
 
-    # 确保有 <brain>，但如果你在微调时已经加过，就可以跳过这行或加个判断
     tokenizer.add_special_tokens({'additional_special_tokens': ['<brain>']})
     model.resize_token_embeddings(len(tokenizer))
 
-    # ---- 4) 构建 ICL dataloader ----
-    icl_loader = create_ICL_dataloader(
-        config=config,
-        mvpformer=mvpformer,
-        tokenizer=tokenizer,
-        split=args.split,
-        subjects=args.subjects,
-        n_demo=args.n_demo,
-        max_length=args.max_length,
-        icl_mode=args.icl_mode,            # 传给 dataloader
-        mc_num_choices=args.mc_num_choices # 传给 dataloader
-    )
+    # ==============================
+    # 情况 1：shared adapter（原逻辑）
+    # ==============================
+    if not args.per_subject:
+        print("\n[Shared adapter] ICL evaluation on subjects:", subjects)
 
-    # ---- 5) 加载 adapter ----
-    print("\nLoading adapter checkpoint ...")
-    adapter = create_simplified_adapter(config.adapter)
-    ckpt = torch.load(args.adapter_checkpoint, map_location='cpu')
-    adapter.load_state_dict(ckpt['model_state_dict'])
-    adapter.to(device)
+        icl_loader = create_ICL_dataloader(
+            config=config,
+            mvpformer=mvpformer,
+            tokenizer=tokenizer,
+            split=args.split,
+            subjects=subjects,
+            n_demo=args.n_demo,
+            max_length=args.max_length,
+            icl_mode=args.icl_mode,
+            mc_num_choices=args.mc_num_choices,
+        )
 
-    # ---- 6) ICL 评估 ----
-    acc = evaluate_icl_with_adapter(
-        model=model,
-        tokenizer=tokenizer,
-        adapter=adapter,
-        dataloader=icl_loader,
-        device=device,
-        max_eval_samples=args.max_eval_samples,
-        icl_mode=args.icl_mode,            # 和 dataloader 保持一致
-    )
+        print("\nLoading shared adapter checkpoint ...")
+        adapter = create_simplified_adapter(config.adapter)
+        ckpt = torch.load(args.adapter_checkpoint, map_location='cpu')
+        adapter.load_state_dict(ckpt['model_state_dict'])
+        adapter.to(device)
 
+        acc, acc_std, n_samples = evaluate_icl_with_adapter(
+            model=model,
+            tokenizer=tokenizer,
+            adapter=adapter,
+            dataloader=icl_loader,
+            device=device,
+            max_eval_samples=args.max_eval_samples,
+            icl_mode=args.icl_mode,
+        )
+
+        print("\nDone.")
+        print(f"Final ICL (shared adapter) accuracy: {acc:.4f}, std={acc_std:.4f}")
+
+        # ====== 保存结果到文件，便于后续画图 ======
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        results_dict = {
+            "mode": "shared",
+            "config": args.config,
+            "icl_mode": args.icl_mode,
+            "n_demo": args.n_demo,          # 保留 few-shot 的 shot 数
+            "split": args.split,
+            "subjects": subjects,
+            "accuracy": float(acc),
+            "std": float(acc_std),
+            "n_samples": int(n_samples),
+        }
+
+        save_path = output_dir / f"icl_{args.icl_mode}_{args.split}_shared_results.yaml"
+        with open(save_path, "w") as f:
+            yaml.safe_dump(results_dict, f)
+
+        print(f"Shared ICL results saved to: {save_path}")
+        return
+
+    # ==============================
+    # 情况 2：per-subject adapter
+    # ==============================
+    print("\n[Per-subject adapter] ICL evaluation.")
+    print("Subjects:", subjects)
+    results = {}
+
+    adapter_root = args.adapter_checkpoint
+
+    for subj_id in subjects:
+        print("\n" + "="*60)
+        print(f"Subject {subj_id:02d}")
+        print("="*60)
+
+        icl_loader = create_ICL_dataloader(
+            config=config,
+            mvpformer=mvpformer,
+            tokenizer=tokenizer,
+            split=args.split,
+            subjects=[subj_id],
+            n_demo=args.n_demo,
+            max_length=args.max_length,
+            icl_mode=args.icl_mode,
+            mc_num_choices=args.mc_num_choices,
+        )
+
+        subj_ckpt_path = os.path.join(
+            adapter_root,
+            f"sub-{subj_id:02d}",
+            "best_model.pt"
+        )
+        print(f"Loading adapter for sub-{subj_id:02d} from: {subj_ckpt_path}")
+        if not os.path.isfile(subj_ckpt_path):
+            print(f"[Warning] Adapter checkpoint not found for subject {subj_id}: {subj_ckpt_path}")
+            results[subj_id] = None
+            continue
+
+        adapter = create_simplified_adapter(config.adapter)
+        ckpt = torch.load(subj_ckpt_path, map_location='cpu')
+        adapter.load_state_dict(ckpt['model_state_dict'])
+        adapter.to(device)
+
+        acc, acc_std, n_samples = evaluate_icl_with_adapter(
+            model=model,
+            tokenizer=tokenizer,
+            adapter=adapter,
+            dataloader=icl_loader,
+            device=device,
+            max_eval_samples=args.max_eval_samples,
+            icl_mode=args.icl_mode,
+        )
+        results[subj_id] = {
+            "acc": acc,
+            "std": acc_std,
+            "n_samples": n_samples,
+        }
+
+    # ====== 汇总并打印 ======
+    print("\n" + "="*70)
+    print("Per-subject ICL summary")
+    print("="*70)
+    valid_acc = []
+
+    for subj_id, info in results.items():
+        if info is None:
+            print(f"Sub-{subj_id:02d}: FAILED")
+            continue
+
+        # 兼容两种情况：
+        # 1）info 是 dict，例如 {"acc": 0.8, "std": 0.05, "n_samples": 100}
+        # 2）info 是单个 float，例如 0.8
+        if isinstance(info, dict):
+            acc = float(info.get("acc", info.get("accuracy")))
+        else:
+            acc = float(info)
+
+        print(f"Sub-{subj_id:02d}: ICL accuracy = {acc:.4f}")
+        valid_acc.append(acc)
+
+    mean_acc = None
+    std_acc_across_subjects = None
+    if valid_acc:
+        mean_acc = sum(valid_acc) / len(valid_acc)
+        if len(valid_acc) > 1:
+            var = sum((a - mean_acc) ** 2 for a in valid_acc) / len(valid_acc)
+            std_acc_across_subjects = var ** 0.5
+        else:
+            std_acc_across_subjects = 0.0
+        print(f"\nMean ICL accuracy across subjects: {mean_acc:.4f} ± {std_acc_across_subjects:.4f}")
+
+    # ====== 保存结果到文件，便于后续画图 ======
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    per_subject_results = {}
+    for s, info in results.items():
+        key = f"sub-{int(s):02d}"
+        if info is None:
+            per_subject_results[key] = None
+        elif isinstance(info, dict):
+            per_subject_results[key] = {
+                "accuracy": float(info.get("acc", info.get("accuracy"))),
+                "std": float(info.get("std", 0.0)),
+                "n_samples": int(info.get("n_samples", 0)),
+            }
+        else:
+            # 如果以后某些地方仍然写入 float，这里也能兜住
+            per_subject_results[key] = {
+                "accuracy": float(info),
+                "std": 0.0,
+                "n_samples": 0,
+            }
+
+    results_dict = {
+        "mode": "per_subject",
+        "config": args.config,
+        "icl_mode": args.icl_mode,
+        "split": args.split,
+        "n_demo": args.n_demo,   # 保留这次是几-shot
+        "subjects": subjects,
+        "per_subject": per_subject_results,
+        "mean_accuracy_across_subjects": mean_acc,
+        "std_across_subjects": std_acc_across_subjects,
+    }
+
+    save_path = output_dir / f"icl_{args.icl_mode}_{args.split}_per_subject_results.yaml"
+    with open(save_path, "w") as f:
+        yaml.safe_dump(results_dict, f)
+
+    print(f"\nPer-subject ICL results saved to: {save_path}")
     print("\nDone.")
-    print(f"Final ICL (with adapter) accuracy: {acc:.4f}")
+
 
 
 if __name__ == "__main__":

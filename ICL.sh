@@ -2,10 +2,12 @@ python framework/ICL.py \
   --config simplified \
   --data_root /user_data/yingjueb/ecog_pretrain/preprocessed \
   --mvpformer_checkpoint mvpformer/ckpts/genie-m-base.pt \
-  --adapter_checkpoint outputs/simplified_qwen/simplified/best_model.pt \
-  --llm_name Qwen/Qwen2.5-1.5B-Instruct \
-  --split train \
-  --n_demo 0 \
+  --adapter_checkpoint outputs/simplified_persub_gpt2/simplified_per_subject \
+  --llm_name openai-community/gpt2 \
+  --split test \
+  --n_demo 1 \
   --max_length 1024 \
   --icl_mode mc \
   --mc_num_choices 4 \
+  --per_subject  \
+  --output_dir outputs/ICL_simplified_persub_gpt2
